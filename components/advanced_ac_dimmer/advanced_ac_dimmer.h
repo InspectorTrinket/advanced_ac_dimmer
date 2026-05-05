@@ -41,6 +41,19 @@ struct AcDimmerDataStore {
   uint8_t init_cycle_count;
   /// Dimmer method
   DimMethod method;
+  /// Zero crossing detection method — stored in ISR struct so gpio_intr() can
+  /// select the correct half-cycle identification strategy for half_cycle_offset.
+  ZcMethod zc_method;
+  /// Signed offset in µs added to disable_time_us on alternate half-cycles to compensate
+  /// Vgs(th) mismatch between back-to-back MOSFETs. Positive extends one half-cycle
+  /// conduction; negative shortens it. Tune with oscilloscope. Trailing method only.
+  /// Half-cycle identity detection depends on zc_method:
+  ///   edges: pin state read at ISR time (deterministic, drift-free).
+  ///   pulse/inverted_pulse: toggle flag (reliable since one interrupt per half-cycle
+  ///   means no drift source in steady state).
+  int16_t half_cycle_offset_us{0};
+  /// Toggle flag for half-cycle tracking in pulse/inverted_pulse modes.
+  bool half_cycle_toggle{false};
 
   uint32_t timer_intr(uint32_t now);
 
@@ -75,6 +88,9 @@ class AcDimmer : public output::FloatOutput, public Component {
   /// Default: true (backward compatible with upstream ac_dimmer behaviour).
   void set_rms_correction(bool enabled) { rms_correction_ = enabled; }
   void set_zc_method(ZcMethod zc_method) { zc_method_ = zc_method; }
+  /// Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th) mismatch.
+  /// Range -500 to +500µs. Tune with oscilloscope. Only effective with method: trailing.
+  void set_half_cycle_offset(int16_t offset_us) { half_cycle_offset_us_ = offset_us; }
 
  protected:
   void write_state(float state) override;
@@ -86,6 +102,7 @@ class AcDimmer : public output::FloatOutput, public Component {
   float max_flat_threshold_{0.0f};  // 0.0 = disabled
   bool rms_correction_{true};
   ZcMethod zc_method_{ZC_METHOD_EDGES};
+  int16_t half_cycle_offset_us_{0};
   DimMethod method_;
 };
 

@@ -43,6 +43,7 @@ CONF_INIT_WITH_N_HALF_CYCLES = "init_with_n_half_cycles"
 CONF_MAX_FLAT_THRESHOLD = "max_flat_threshold"
 CONF_RMS_CORRECTION = "rms_correction"
 CONF_ZC_METHOD = "zc_method"
+CONF_HALF_CYCLE_OFFSET = "half_cycle_offset"
 
 
 def validate_flat_zone(config):
@@ -94,6 +95,13 @@ CONFIG_SCHEMA = cv.All(
             # perceptually identical to maximum, reducing heat and switching losses.
             # Requires gamma_correct: 0 (or 1) on the light entity — see README.
             cv.Optional(CONF_MAX_FLAT_THRESHOLD): cv.float_range(min=0.01, max=0.99),
+            # Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th)
+            # mismatch in back-to-back MOSFET topologies. Causes asymmetric conduction windows
+            # on positive vs negative half-cycles, visible as flicker on capacitorless loads.
+            # Positive: extends odd half-cycle conduction. Negative: shortens it.
+            # Tune empirically with an oscilloscope until both half-cycles match.
+            # Only effective with method: trailing. Default 0 (disabled).
+            cv.Optional(CONF_HALF_CYCLE_OFFSET, default=0): cv.int_range(min=-500, max=500),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     validate_flat_zone,
@@ -113,6 +121,7 @@ async def to_code(config):
 
     cg.add(var.set_method(config[CONF_METHOD]))
     cg.add(var.set_zc_method(config[CONF_ZC_METHOD]))
+    cg.add(var.set_half_cycle_offset(config[CONF_HALF_CYCLE_OFFSET]))
     cg.add(var.set_init_with_n_half_cycles(config[CONF_INIT_WITH_N_HALF_CYCLES]))
     cg.add(var.set_rms_correction(config[CONF_RMS_CORRECTION]))
 

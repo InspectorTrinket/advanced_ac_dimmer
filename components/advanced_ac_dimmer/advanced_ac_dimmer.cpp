@@ -119,11 +119,44 @@ void IRAM_ATTR HOT AcDimmerDataStore::gpio_intr() {
     this->gate_pin.digital_write(false);
   } else {
     auto min_us = this->cycle_time_us * this->min_power / 1000;
+    // Determine whether to apply the half-cycle offset on this interrupt.
+    // Shared across all dim methods — detection strategy depends on zc_method.
+    bool apply_half_cycle_offset = false;
+    if (this->half_cycle_offset_us != 0) {
+      if (this->zc_method == ZC_METHOD_EDGES) {
+        // edges mode: read ZC pin state at ISR time — completely deterministic.
+        // Pin LOW = falling edge just fired = negative half-cycle start
+        // (for a high-on-positive NPN ZCD circuit). Cannot drift or be corrupted
+        // by kickstart or fully-on/off early exits, unlike a toggle counter.
+        apply_half_cycle_offset = !this->zero_cross_pin.digital_read();
+      } else {
+        // pulse / inverted_pulse: one interrupt per half-cycle so toggle is reliable.
+        // No early-exit corruption source exists at 60Hz trigger rate.
+        this->half_cycle_toggle = !this->half_cycle_toggle;
+        apply_half_cycle_offset = this->half_cycle_toggle;
+      }
+    }
+
     if (this->method == DIM_METHOD_TRAILING) {
       this->enable_time_us = 1;  // cannot be 0
-      this->disable_time_us = std::max((uint32_t) 10, this->value * (this->cycle_time_us - min_us) / 65535 + min_us);
+      // Base conduction window from brightness value.
+      uint32_t base_disable = this->value * (this->cycle_time_us - min_us) / 65535 + min_us;
+      // Positive offset = more conduction = larger disable_time_us.
+      int32_t adjusted_disable = (int32_t)base_disable;
+      if (apply_half_cycle_offset) {
+        adjusted_disable += this->half_cycle_offset_us;
+      }
+      this->disable_time_us = (uint32_t)std::max((int32_t)10, adjusted_disable);
     } else {
-      this->enable_time_us = std::max((uint32_t) 1, ((65535 - this->value) * (this->cycle_time_us - min_us)) / 65535);
+      uint32_t base_enable = std::max((uint32_t) 1, ((65535 - this->value) * (this->cycle_time_us - min_us)) / 65535);
+      // Positive offset = more conduction = smaller enable_time_us (gate fires earlier).
+      // Offset sign is inverted vs trailing so user-facing meaning stays consistent:
+      // positive half_cycle_offset always means "more conduction on offset half-cycle."
+      int32_t adjusted_enable = (int32_t)base_enable;
+      if (apply_half_cycle_offset) {
+        adjusted_enable -= this->half_cycle_offset_us;
+      }
+      this->enable_time_us = (uint32_t)std::max((int32_t)1, adjusted_enable);
 
       if (this->method == DIM_METHOD_LEADING_PULSE) {
         this->disable_time_us = std::max(this->enable_time_us + GATE_ENABLE_TIME, (uint32_t) cycle_time_us / 10);
@@ -170,10 +203,14 @@ void AcDimmer::setup() {
   this->store_.min_power = static_cast<uint16_t>(this->min_power_ * 1000);
   this->min_power_ = 0;
   this->store_.method = this->method_;
+  this->store_.zc_method = this->zc_method_;
+  this->store_.half_cycle_offset_us = this->half_cycle_offset_us_;
 
   if (setup_zero_cross_pin) {
+    // Only call setup() and attach the interrupt once, for the dimmer that owns the ZC pin.
+    // Calling setup() a second time (for a shared-pin dimmer) resets GPIO config and clears
+    // the interrupt already attached by the first dimmer, killing all output.
     this->zero_cross_pin_->setup();
-    this->store_.zero_cross_pin = this->zero_cross_pin_->to_isr();
     // Select interrupt mode based on configured zc_method:
     //   edges          → ANY_EDGE:     sustained-level ZCD (H11A1-based). Both edges = ZC.
     //   pulse          → FALLING_EDGE: active-low narrow pulse (upstream ac_dimmer default).
@@ -194,6 +231,12 @@ void AcDimmer::setup() {
     this->zero_cross_pin_->attach_interrupt(&AcDimmerDataStore::s_gpio_intr, &this->store_,
                                             intr_type);
   }
+  // Always initialize zero_cross_pin in the store, even for shared-pin dimmers that do not
+  // own the interrupt. gpio_intr() calls digital_read() on this field to identify the
+  // half-cycle polarity — it must be valid for every dimmer instance.
+  // to_isr() is a pure handle conversion with no hardware side effects, safe to call
+  // on an already-configured pin without disturbing the interrupt attachment.
+  this->store_.zero_cross_pin = this->zero_cross_pin_->to_isr();
 
 #ifdef USE_ESP8266
   setTimer1Callback(&timer_interrupt);
@@ -309,6 +352,11 @@ void AcDimmer::dump_config() {
     ESP_LOGCONFIG(TAG, "   ZC method: inverted pulse (rising edge)");
   } else {
     ESP_LOGCONFIG(TAG, "   ZC method: edges (any edge)");
+  }
+  if (this->half_cycle_offset_us_ != 0) {
+    ESP_LOGCONFIG(TAG, "   Half-cycle offset: %d µs (applied to odd half-cycles)", this->half_cycle_offset_us_);
+  } else {
+    ESP_LOGCONFIG(TAG, "   Half-cycle offset: disabled");
   }
   LOG_FLOAT_OUTPUT(this);
   ESP_LOGV(TAG, "  Estimated Frequency: %.3fHz", 1e6f / this->store_.cycle_time_us / 2);
