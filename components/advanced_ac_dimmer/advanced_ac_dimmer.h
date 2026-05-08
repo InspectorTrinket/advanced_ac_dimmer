@@ -1,8 +1,45 @@
 #pragma once
 
+/**
+ * advanced_ac_dimmer — ESP32 AC phase-angle dimmer for ESPHome
+ *
+ * Timer architecture (revised, flicker-free):
+ *   Each channel owns two esp_timer one-shots:
+ *     enable_timer  — ZC → gate HIGH  (leading / leading_pulse methods)
+ *     disable_timer — gate HIGH → LOW (trailing: armed from ZC ISR;
+ *                                      leading_pulse: armed from enable_timer cb)
+ *
+ *   On every zero-crossing s_gpio_intr() runs a strict two-pass protocol:
+ *     Pass 1: stop both timers + drive gate LOW for EVERY channel sharing the ZC pin.
+ *     Pass 2: call gpio_intr() per channel to compute timing and arm timers.
+ *
+ *   This guarantees the gate is deasserted at the zero crossing instant before
+ *   any new timer is armed, eliminating a race that causes jitter.
+ *
+ *   Timers use ESP_TIMER_ISR dispatch when CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
+ *   is enabled (~1µs jitter); fall back to ESP_TIMER_TASK otherwise (~10–50µs).
+ *
+ *   esp_timer_get_time() is used for all ZC timestamps — consistent timebase
+ *   with esp_timer internals, eliminating the drift that occurred when micros()
+ *   and GPTimer ran from different clock sources.
+ *
+ * Other features:
+ *   trailing / leading_pulse / leading methods
+ *   edges / pulse / inverted_pulse ZC detection
+ *   N-half-cycle kickstart (init_with_n_half_cycles)
+ *   Brightness curve: rms / linear / logarithmic (curve option)
+ *   Flat zone elimination (max_flat_threshold)
+ *   Half-cycle offset for MOSFET Vgs(th) mismatch compensation
+ *   Multi-channel shared ZC pin
+ */
+
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/components/output/float_output.h"
+
+#ifdef USE_ESP32
+#include "esp_timer.h"
+#endif
 
 namespace esphome::advanced_ac_dimmer {
 
@@ -10,86 +47,101 @@ enum DimMethod { DIM_METHOD_LEADING_PULSE = 0, DIM_METHOD_LEADING, DIM_METHOD_TR
 
 /// Zero crossing detection circuit type.
 ///   edges          - INTERRUPT_ANY_EDGE: both edges are zero crossings.
-///                    Use with sustained-level circuits (e.g. H11A1-based: 0V positive
-///                    half-cycle, 3.3V negative half-cycle). Default.
-///   pulse          - INTERRUPT_FALLING_EDGE: active-low pulse at each zero crossing.
-///                    Equivalent to the original upstream ac_dimmer behaviour.
-///   inverted_pulse - INTERRUPT_RISING_EDGE: active-high pulse at each zero crossing.
+///                    Use with sustained-level circuit — 0V on positive half-cycle, Vcc on negative (60 Hz Square Wave).
+///   pulse          - INTERRUPT_FALLING_EDGE: active-low narrow pulse at each zero crossing (120 Hz low pulse train)
+///   inverted_pulse - INTERRUPT_RISING_EDGE: active-high narrow pulse at each zero crossing (120 Hz high pulse train).
 enum ZcMethod { ZC_METHOD_EDGES = 0, ZC_METHOD_PULSE, ZC_METHOD_INVERTED_PULSE };
 
+/// Brightness-to-conduction-angle mapping curve.
+///   linear      - No compensation. Conduction fraction maps linearly to value.
+///                 Use when the load or driver already provides its own
+///                 linearisation, or for testing.
+///   rms         - acos(1 − 2s)/π compensation. Corrects the nonlinear
+///                 relationship between phase-angle conduction fraction and RMS
+///                 power. Correct for resistive / incandescent loads where
+///                 brightness ~ RMS power. Default.
+///   logarithmic - log₁₀(1 + 9·s) perceptual curve. Allocates more dimmer
+///                 steps at low brightness where the eye is most sensitive.
+///                 Best for LED loads with constant-current switching drivers,
+///                 where brightness is already linear with conduction fraction
+///                 so the rms acos transform over-corrects.
+enum DimCurve { DIM_CURVE_RMS = 0, DIM_CURVE_LINEAR, DIM_CURVE_LOGARITHMIC };
+
 struct AcDimmerDataStore {
-  /// Zero-cross pin
+  // ── Input / output handles ────────────────────────────────────────────────
   ISRInternalGPIOPin zero_cross_pin;
-  /// Zero-cross pin number - used to share ZC pin across multiple dimmers
   uint8_t zero_cross_pin_number;
-  /// Output pin to write to
   ISRInternalGPIOPin gate_pin;
-  /// Value of the dimmer - 0 to 65535.
-  uint16_t value;
-  /// Minimum power for activation
-  uint16_t min_power;
-  /// Time between the last two ZC pulses (half-cycle duration in µs)
-  uint32_t cycle_time_us;
-  /// Time (in micros()) of last ZC signal
-  uint32_t crossed_zero_at;
-  /// Time since last ZC pulse to enable gate pin. 0 means not set.
-  uint32_t enable_time_us;
-  /// Time since last ZC pulse to disable gate pin. 0 means no disable.
-  uint32_t disable_time_us;
-  /// Countdown of full half-cycles remaining to send on turn-on kickstart.
-  /// 0 = no kickstart active. Decremented by gpio_intr() on each zero crossing.
-  uint8_t init_cycle_count;
-  /// Dimmer method
-  DimMethod method;
-  /// Zero crossing detection method — stored in ISR struct so gpio_intr() can
-  /// select the correct half-cycle identification strategy for half_cycle_offset.
-  ZcMethod zc_method;
-  /// Signed offset in µs added to disable_time_us on alternate half-cycles to compensate
-  /// Vgs(th) mismatch between back-to-back MOSFETs. Positive extends one half-cycle
-  /// conduction; negative shortens it. Tune with oscilloscope. Trailing method only.
-  /// Half-cycle identity detection depends on zc_method:
-  ///   edges: pin state read at ISR time (deterministic, drift-free).
-  ///   pulse/inverted_pulse: toggle flag (reliable since one interrupt per half-cycle
-  ///   means no drift source in steady state).
-  int16_t half_cycle_offset_us{0};
-  /// Toggle flag for half-cycle tracking in pulse/inverted_pulse modes.
-  bool half_cycle_toggle{false};
 
-  uint32_t timer_intr(uint32_t now);
+  // ── Fields shared between main-context writes and ISR reads ──────────────
+  // volatile prevents the compiler from caching them across context boundaries.
+  volatile uint16_t value;           ///< Brightness: 0=off, 65535=fully on
+  volatile uint16_t min_power;       ///< Min conduction, stored as 0–1000 (per-mille)
+  volatile uint32_t cycle_time_us;   ///< Last measured half-cycle duration [µs]
+  volatile int64_t  last_zc_time;    ///< esp_timer_get_time() at last valid ZC [µs]
+  volatile uint8_t  init_cycle_count;///< Kickstart half-cycles remaining; 0 = inactive
 
-  void gpio_intr();
-  static void s_gpio_intr(AcDimmerDataStore *store);
+  // ── Per-channel esp_timer one-shots (created once in setup()) ────────────
 #ifdef USE_ESP32
-  static void s_timer_intr();
+  esp_timer_handle_t enable_timer;   ///< ZC → gate HIGH  (leading / leading_pulse)
+  esp_timer_handle_t disable_timer;  ///< gate HIGH → LOW
+  /// Pulse width for leading_pulse: written in gpio_intr(), read in enable_timer_cb().
+  volatile uint32_t pending_disable_us;
+#endif
+
+  // ── Configuration (written once from setup(), read by ISR) ───────────────
+  DimMethod method;
+  ZcMethod  zc_method;
+  int16_t   half_cycle_offset_us{0};
+  bool      half_cycle_toggle{false};
+
+  // ── ISR methods ──────────────────────────────────────────────────────────
+  /// Compute timing for this half-cycle and arm the appropriate timer(s).
+  /// Called from s_gpio_intr() *after* pass 1 has already stopped timers and
+  /// driven the gate LOW.
+  void gpio_intr();
+
+  /// GPIO ISR entry point. Implements the two-pass protocol and dispatches
+  /// gpio_intr() for every channel that shares this ZC pin.
+  static void s_gpio_intr(AcDimmerDataStore *store);
+
+#ifdef USE_ESP32
+  /// esp_timer callback: fires gate HIGH (and for leading_pulse, arms disable_timer).
+  static void enable_timer_cb(void *arg);
+  /// esp_timer callback: drives gate LOW.
+  static void disable_timer_cb(void *arg);
 #endif
 };
 
 class AcDimmer : public output::FloatOutput, public Component {
  public:
   void setup() override;
-
   void dump_config() override;
+
   void set_gate_pin(InternalGPIOPin *gate_pin) { gate_pin_ = gate_pin; }
   void set_zero_cross_pin(InternalGPIOPin *zero_cross_pin) { zero_cross_pin_ = zero_cross_pin; }
-  /// Number of full half-cycles to send at full power when turning on from off.
-  /// 0 disables the kickstart. 1 = equivalent to upstream init_with_half_cycle: true.
+
+  /// Number of full half-cycles at maximum conduction sent when the output turns on
+  /// from off. 0 disables kickstart. 1 is equivalent to upstream init_with_half_cycle.
   void set_init_with_n_half_cycles(uint8_t n) { init_with_n_half_cycles_ = n; }
+
   void set_method(DimMethod method) { method_ = method; }
-  /// Flat zone threshold (0.0 = disabled). When state >= threshold, output jumps
-  /// directly to max_power_ (from the FloatOutput base class) instead of continuing
-  /// to dim linearly. Eliminates the dead zone where the MOSFET is still switching
-  /// but lamp output is perceptually indistinguishable from maximum.
-  /// NOTE: requires gamma_correct: 0 (or 1) on the light entity — see write_state().
+
+  /// Flat zone threshold (0.0 = disabled). Slider 100% jumps to max_power_;
+  /// slider 1–99% spans min_power to max_flat_threshold linearly.
+  /// Requires gamma_correct: 0 on the light entity.
   void set_max_flat_threshold(float threshold) { max_flat_threshold_ = threshold; }
-  /// Whether to apply acos RMS power compensation in write_state.
-  /// Correct for resistive/incandescent loads where brightness ∝ RMS power.
-  /// For LED lamps with constant-current switching drivers, brightness is proportional
-  /// to conduction fraction (linear), so acos over-corrects. Set false for LEDs.
-  /// Default: true (backward compatible with upstream ac_dimmer behaviour).
-  void set_rms_correction(bool enabled) { rms_correction_ = enabled; }
+
+  /// Brightness curve applied in write_state().
+  ///   rms         — acos RMS compensation (default, resistive/incandescent loads)
+  ///   linear      — no compensation
+  ///   logarithmic — log₁₀(1+9s) perceptual curve (LED loads)
+  void set_curve(DimCurve curve) { curve_ = curve; }
+
   void set_zc_method(ZcMethod zc_method) { zc_method_ = zc_method; }
-  /// Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th) mismatch.
-  /// Range -500 to +500µs. Tune with oscilloscope. Only effective with method: trailing.
+
+  /// Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th)
+  /// mismatch. Range ±500µs. Tune with oscilloscope.
   void set_half_cycle_offset(int16_t offset_us) { half_cycle_offset_us_ = offset_us; }
 
  protected:
@@ -99,10 +151,10 @@ class AcDimmer : public output::FloatOutput, public Component {
   InternalGPIOPin *zero_cross_pin_;
   AcDimmerDataStore store_;
   uint8_t init_with_n_half_cycles_{0};
-  float max_flat_threshold_{0.0f};  // 0.0 = disabled
-  bool rms_correction_{true};
+  float   max_flat_threshold_{0.0f};
+  DimCurve curve_{DIM_CURVE_RMS};
   ZcMethod zc_method_{ZC_METHOD_EDGES};
-  int16_t half_cycle_offset_us_{0};
+  int16_t  half_cycle_offset_us_{0};
   DimMethod method_;
 };
 

@@ -1,220 +1,289 @@
 #include "advanced_ac_dimmer.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 
-#ifdef USE_ESP8266
-#include <core_esp8266_waveform.h>
-#endif
-
 #ifdef USE_ESP32
-#include "hw_timer_esp_idf.h"
+#include "esp_timer.h"
+#include "esp_attr.h"
 #endif
 
 namespace esphome::advanced_ac_dimmer {
 
 static const char *const TAG = "advanced_ac_dimmer";
 
-// Global array to store dimmer objects
-static AcDimmerDataStore *all_dimmers[32];  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// ── ISR-accessible global ─────────────────────────────────────────────────────
+// DRAM_ATTR: the array is read by s_gpio_intr() (GPIO ISR context).
+// Without it, a flash-cache miss during NVS/OTA activity stalls the ISR and
+// produces timing spikes that are visible as flicker.
+static DRAM_ATTR AcDimmerDataStore *all_dimmers[32];  // NOLINT
 
-/// Time in microseconds the gate should be held high
-/// 10µs should be long enough for most triacs/MOSFETs
-/// For reference: BT136 datasheet says 2µs nominal (page 7)
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Minimum time in µs between two accepted zero-crossing edges.
+/// Rejects MOSFET switching noise and optocoupler bounce that would otherwise
+/// reset the timer chain mid-half-cycle and cause missed gate pulses → flicker.
+/// At 60 Hz a half-cycle is 8333 µs; 3000 µs is well below that but above any
+/// legitimate glitch from the AC waveform.
+static constexpr uint32_t ZC_DEBOUNCE_US = 3000;
+
+/// Minimum time in µs the gate is held high for a leading_pulse or to ensure a
+/// trailing gate-on pulse is wide enough for the MOSFET to fully turn on.
 static constexpr uint32_t GATE_ENABLE_TIME = 50;
 
+// ── ESP_TIMER dispatch selection ──────────────────────────────────────────────
+// ESP_TIMER_ISR dispatch gives ~1 µs callback latency but requires the IDF
+// Kconfig option CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y.
+// Arduino Core 3.x on ESP32-C3 does NOT enable this option by default;
+// Fall back to ESP_TIMER_TASK dispatch (~10–50 µs).
 #ifdef USE_ESP32
-/// Timer frequency in Hz (1 MHz = 1µs resolution)
-static constexpr uint32_t TIMER_FREQUENCY_HZ = 1000000;
-/// Timer interrupt interval in microseconds
-static constexpr uint64_t TIMER_INTERVAL_US = 50;
+#ifdef CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
+  #define DIMMER_TIMER_DISPATCH  ESP_TIMER_ISR
+#else
+  #define DIMMER_TIMER_DISPATCH  ESP_TIMER_TASK
+#endif
 #endif
 
-/// Function called from timer interrupt
-/// Input is current time in microseconds (micros())
-/// Returns when next "event" is expected in µs, or 0 if no such event known.
-uint32_t IRAM_ATTR HOT AcDimmerDataStore::timer_intr(uint32_t now) {
-  // If no ZC signal received yet.
-  if (this->crossed_zero_at == 0)
-    return 0;
+// ── Timer callbacks ───────────────────────────────────────────────────────────
 
-  uint32_t time_since_zc = now - this->crossed_zero_at;
-  if (this->value == 65535 || this->value == 0) {
-    return 0;
-  }
+#ifdef USE_ESP32
 
-  if (this->enable_time_us != 0 && time_since_zc >= this->enable_time_us) {
-    this->enable_time_us = 0;
-    this->gate_pin.digital_write(true);
-    // Prevent too short pulses
-    this->disable_time_us = std::max(this->disable_time_us, time_since_zc + GATE_ENABLE_TIME);
+/// enable_timer callback — fires gate HIGH after the leading delay has elapsed.
+/// For leading_pulse: chains into disable_timer to produce a fixed-width gate pulse.
+/// For leading: gate stays high until the next zero-crossing clears it in pass 1.
+///
+/// IRAM_ATTR: must reside in IRAM so it can run during flash operations without
+/// a cache miss introducing unpredictable latency.
+void IRAM_ATTR AcDimmerDataStore::enable_timer_cb(void *arg) {
+  auto *store = reinterpret_cast<AcDimmerDataStore *>(arg);
+  store->gate_pin.digital_write(true);
+  if (store->method == DIM_METHOD_LEADING_PULSE) {
+    esp_timer_start_once(store->disable_timer, store->pending_disable_us);
   }
-  if (this->disable_time_us != 0 && time_since_zc >= this->disable_time_us) {
-    this->disable_time_us = 0;
-    this->gate_pin.digital_write(false);
-  }
-
-  if (time_since_zc < this->enable_time_us) {
-    return this->enable_time_us - time_since_zc;
-  } else if (time_since_zc < disable_time_us) {
-    return this->disable_time_us - time_since_zc;
-  }
-
-  if (time_since_zc >= this->cycle_time_us) {
-    return 100;
-  }
-
-  return this->cycle_time_us - time_since_zc;
+  // DIM_METHOD_LEADING: gate held high until next ZC s_gpio_intr pass 1 clears it.
 }
 
-/// Run timer interrupt code and return in how many µs the next event is expected
-uint32_t IRAM_ATTR HOT timer_interrupt() {
-  // run at least with 1kHz
-  uint32_t min_dt_us = 1000;
-  uint32_t now = micros();
-  for (auto *dimmer : all_dimmers) {
-    if (dimmer == nullptr) {
-      break;
-    }
-    uint32_t res = dimmer->timer_intr(now);
-    if (res != 0 && res < min_dt_us)
-      min_dt_us = res;
-  }
-  return min_dt_us;
+/// disable_timer callback — drives gate LOW.
+void IRAM_ATTR AcDimmerDataStore::disable_timer_cb(void *arg) {
+  auto *store = reinterpret_cast<AcDimmerDataStore *>(arg);
+  store->gate_pin.digital_write(false);
 }
 
-/// GPIO interrupt routine, called on both edges of the ZC signal.
-/// Both rising and falling edges represent zero crossings when the ZCD circuit
-/// outputs a sustained level (0V on positive half-cycle, 3.3V on negative half-cycle)
-/// rather than a narrow pulse. INTERRUPT_ANY_EDGE is set in setup() to ensure both
-/// zero crossings per mains cycle are detected, giving correct half-cycle timing.
+#endif  // USE_ESP32
+
+// ── Zero-crossing handler ─────────────────────────────────────────────────────
+
+/// gpio_intr: called by s_gpio_intr (pass 2) after timers have been stopped and
+/// gate driven LOW. Computes timing for this half-cycle and arms the appropriate
+/// esp_timer one-shot(s).
+///
+/// All timing is derived from esp_timer_get_time() which is the same high-resolution
+/// timebase that esp_timer uses internally, eliminating clock-domain mismatch.
 void IRAM_ATTR HOT AcDimmerDataStore::gpio_intr() {
-  uint32_t prev_crossed = this->crossed_zero_at;
+#ifndef USE_ESP32
+  // Non-ESP32 targets (ESP8266): not supported with this timer architecture.
+  return;
+#else
+  // ── Timestamp & debounce ─────────────────────────────────────────────────
+  // esp_timer_get_time() returns µs since boot from the same hardware counter
+  // that backs all esp_timer one-shots — no drift between ZC timestamps and
+  // timer arming.
+  int64_t now = esp_timer_get_time();
 
-  // At 60Hz a half-cycle is 8.33ms; at 50Hz it is 10ms.
-  // The noise filter threshold of 5ms rejects spurious edges within the same pulse.
-  this->crossed_zero_at = micros();
-  uint32_t cycle_time = this->crossed_zero_at - prev_crossed;
-  if (cycle_time > 5000) {
-    this->cycle_time_us = cycle_time;
-  } else {
-    this->cycle_time_us += cycle_time;
+  if (this->last_zc_time != 0) {
+    int64_t elapsed = now - this->last_zc_time;
+
+    // Debounce: reject edges within ZC_DEBOUNCE_US of the previous accepted edge.
+    // Eliminates MOSFET switching transients and optocoupler bounce that would
+    // otherwise start a new timer chain mid-half-cycle.
+    if (elapsed < static_cast<int64_t>(ZC_DEBOUNCE_US)) {
+      return;
+    }
+
+    // Update half-cycle duration from the measured interval.
+    // Valid range 5 ms – 15 ms covers 33 Hz – 100 Hz with margin.
+    if (elapsed > 5000 && elapsed < 15000) {
+      this->cycle_time_us = static_cast<uint32_t>(elapsed);
+    }
+  }
+  this->last_zc_time = now;
+
+  // ── Arm output for this half-cycle ───────────────────────────────────────
+
+  // Fully on: gate HIGH immediately, no timer needed.
+  if (this->value == 65535) {
+    this->gate_pin.digital_write(true);
+    return;
   }
 
-  if (this->value == 65535) {
-    // fully on, enable output immediately
-    this->gate_pin.digital_write(true);
-  } else if (this->init_cycle_count > 0) {
-    // Kickstart: drive gate high immediately and hold for the full half-cycle.
-    // enable_time_us must NOT be set to 0 here — 0 means "not set" in timer_intr
-    // and the gate would never be enabled. Drive it directly instead, same as the
-    // value==65535 path, then let disable_time_us turn it off at end of half-cycle.
+  // Kickstart: drive gate high for the full half-cycle to charge LED driver caps.
+  if (this->init_cycle_count > 0) {
     this->init_cycle_count--;
     this->gate_pin.digital_write(true);
-    this->enable_time_us = 0;            // already on — no timer enable needed
-    this->disable_time_us = cycle_time_us;
-  } else if (this->value == 0) {
-    // fully off, disable output immediately
-    this->gate_pin.digital_write(false);
-  } else {
-    auto min_us = this->cycle_time_us * this->min_power / 1000;
-    // Determine whether to apply the half-cycle offset on this interrupt.
-    // Shared across all dim methods — detection strategy depends on zc_method.
-    bool apply_half_cycle_offset = false;
-    if (this->half_cycle_offset_us != 0) {
-      if (this->zc_method == ZC_METHOD_EDGES) {
-        // edges mode: read ZC pin state at ISR time — completely deterministic.
-        // Pin LOW = falling edge just fired = negative half-cycle start
-        // (for a high-on-positive NPN ZCD circuit). Cannot drift or be corrupted
-        // by kickstart or fully-on/off early exits, unlike a toggle counter.
-        apply_half_cycle_offset = !this->zero_cross_pin.digital_read();
-      } else {
-        // pulse / inverted_pulse: one interrupt per half-cycle so toggle is reliable.
-        // No early-exit corruption source exists at 60Hz trigger rate.
-        this->half_cycle_toggle = !this->half_cycle_toggle;
-        apply_half_cycle_offset = this->half_cycle_toggle;
-      }
+    // Arm disable_timer to pull gate LOW at end of half-cycle.
+    // If cycle_time_us is not yet known (very first ZC), skip — the next ZC's
+    // pass 1 will clear the gate.
+    if (this->cycle_time_us > 0) {
+      esp_timer_start_once(this->disable_timer, this->cycle_time_us);
     }
+    return;
+  }
 
-    if (this->method == DIM_METHOD_TRAILING) {
-      this->enable_time_us = 1;  // cannot be 0
-      // Base conduction window from brightness value.
-      uint32_t base_disable = this->value * (this->cycle_time_us - min_us) / 65535 + min_us;
-      // Positive offset = more conduction = larger disable_time_us.
-      int32_t adjusted_disable = (int32_t)base_disable;
-      if (apply_half_cycle_offset) {
-        adjusted_disable += this->half_cycle_offset_us;
-      }
-      this->disable_time_us = (uint32_t)std::max((int32_t)10, adjusted_disable);
+  // Fully off or no timing data yet: gate stays LOW (already done in pass 1).
+  if (this->value == 0 || this->cycle_time_us == 0) {
+    return;
+  }
+
+  // ── Timing computation ───────────────────────────────────────────────────
+  // min_power is stored as per-mille (0–1000); convert to µs offset.
+  uint32_t min_us = this->cycle_time_us * this->min_power / 1000;
+
+  // Half-cycle offset — compensates Vgs(th) mismatch between back-to-back MOSFETs.
+  bool apply_offset = false;
+  if (this->half_cycle_offset_us != 0) {
+    if (this->zc_method == ZC_METHOD_EDGES) {
+      // Read ZC pin state at ISR time: fully deterministic, cannot drift.
+      // Pin LOW = falling edge just fired = start of negative half-cycle
+      // (for a high-on-positive H11A1-based ZCD circuit).
+      apply_offset = !this->zero_cross_pin.digital_read();
     } else {
-      uint32_t base_enable = std::max((uint32_t) 1, ((65535 - this->value) * (this->cycle_time_us - min_us)) / 65535);
-      // Positive offset = more conduction = smaller enable_time_us (gate fires earlier).
-      // Offset sign is inverted vs trailing so user-facing meaning stays consistent:
-      // positive half_cycle_offset always means "more conduction on offset half-cycle."
-      int32_t adjusted_enable = (int32_t)base_enable;
-      if (apply_half_cycle_offset) {
-        adjusted_enable -= this->half_cycle_offset_us;
-      }
-      this->enable_time_us = (uint32_t)std::max((int32_t)1, adjusted_enable);
-
-      if (this->method == DIM_METHOD_LEADING_PULSE) {
-        this->disable_time_us = std::max(this->enable_time_us + GATE_ENABLE_TIME, (uint32_t) cycle_time_us / 10);
-      } else {
-        this->gate_pin.digital_write(false);
-        this->disable_time_us = this->cycle_time_us;
-      }
+      // pulse / inverted_pulse: one interrupt per half-cycle, toggle is reliable.
+      this->half_cycle_toggle = !this->half_cycle_toggle;
+      apply_offset = this->half_cycle_toggle;
     }
   }
+
+  if (this->method == DIM_METHOD_TRAILING) {
+    // ── Trailing edge (back-to-back MOSFET) ─────────────────────────────
+    // Gate turns on immediately at ZC; disable_timer turns it off after the
+    // computed conduction window. Positive half_cycle_offset extends conduction
+    // (larger disable time) on the identified half-cycle.
+    uint32_t base_disable = this->value * (this->cycle_time_us - min_us) / 65535 + min_us;
+    int32_t  adj          = static_cast<int32_t>(base_disable);
+    if (apply_offset) {
+      adj += static_cast<int32_t>(this->half_cycle_offset_us);
+    }
+    uint32_t disable_us = static_cast<uint32_t>(
+        std::max(static_cast<int32_t>(GATE_ENABLE_TIME + 1), adj));
+
+    this->gate_pin.digital_write(true);
+    esp_timer_start_once(this->disable_timer, disable_us);
+
+  } else {
+    // ── Leading edge (TRIAC or leading-edge MOSFET) ───────────────────
+    // Gate is LOW at ZC (done in pass 1). enable_timer fires after the leading
+    // delay; its callback drives gate HIGH and — for leading_pulse — chains
+    // disable_timer for a fixed-width gate pulse.
+    // Positive half_cycle_offset means more conduction = smaller enable delay.
+    uint32_t base_enable = std::max(static_cast<uint32_t>(1),
+        ((65535 - this->value) * (this->cycle_time_us - min_us)) / 65535);
+    int32_t  adj         = static_cast<int32_t>(base_enable);
+    if (apply_offset) {
+      adj -= static_cast<int32_t>(this->half_cycle_offset_us);
+    }
+    uint32_t enable_us = static_cast<uint32_t>(std::max(static_cast<int32_t>(1), adj));
+
+    if (this->method == DIM_METHOD_LEADING_PULSE) {
+      // enable_timer_cb will use this to start disable_timer.
+      this->pending_disable_us = GATE_ENABLE_TIME;
+    }
+    // DIM_METHOD_LEADING: gate stays high after enable_timer_cb fires; the next
+    // ZC's pass 1 stops enable_timer (if still pending) and drives gate LOW.
+
+    esp_timer_start_once(this->enable_timer, enable_us);
+  }
+#endif  // USE_ESP32
 }
 
+/// GPIO ISR entry point — two-pass protocol.
+///
+/// Pass 1 (loop): for every channel sharing this ZC pin, stop both timers
+///   and drive the gate LOW immediately. This is the hard synchronisation
+///   point — all outputs are deasserted at the same instant the zero-crossing
+///   is detected, before any new timer is armed.
+///
+/// Pass 2 (loop): call gpio_intr() on each channel to compute timing and
+///   arm the appropriate esp_timer one-shot(s) for the new half-cycle.
+///
+/// The two-pass split eliminates a race condition where a stale disable_timer 
+/// from the previous half-cycle could overlap with the freshly armed enable_timer 
+/// of the new half-cycle.
 void IRAM_ATTR HOT AcDimmerDataStore::s_gpio_intr(AcDimmerDataStore *store) {
-  // When multiple dimmers share the same ZC pin, trigger all of them.
+#ifdef USE_ESP32
+  // ── Pass 1: stop timers + gate LOW ─────────────────────────────────────
   for (auto *dimmer : all_dimmers) {
-    if (dimmer == nullptr)
-      break;
+    if (dimmer == nullptr) break;
+    if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
+      esp_timer_stop(dimmer->enable_timer);
+      esp_timer_stop(dimmer->disable_timer);
+      dimmer->gate_pin.digital_write(false);
+    }
+  }
+  // ── Pass 2: arm timers for the new half-cycle ───────────────────────────
+  for (auto *dimmer : all_dimmers) {
+    if (dimmer == nullptr) break;
     if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
       dimmer->gpio_intr();
     }
   }
+#else
+  // ESP8266: single-pass fallback (no esp_timer support in this implementation)
+  for (auto *dimmer : all_dimmers) {
+    if (dimmer == nullptr) break;
+    if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
+      dimmer->gpio_intr();
+    }
+  }
+#endif
 }
 
-#ifdef USE_ESP32
-static HWTimer *dimmer_timer = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-void IRAM_ATTR HOT AcDimmerDataStore::s_timer_intr() { timer_interrupt(); }
-#endif
+// ── AcDimmer::setup() ─────────────────────────────────────────────────────────
 
 void AcDimmer::setup() {
-  auto setup_zero_cross_pin = true;
+  // Determine whether this instance is the first to register this ZC pin.
+  // Only the first registration calls zero_cross_pin_->setup() and attaches
+  // the ISR — re-doing it on a second dimmer would reset GPIO config and
+  // detach the interrupt already installed by the first, killing all output.
+  bool setup_zero_cross_pin = true;
 
-  for (auto &all_dimmer : all_dimmers) {
-    if (all_dimmer == nullptr) {
-      all_dimmer = &this->store_;
+  for (auto &slot : all_dimmers) {
+    if (slot == nullptr) {
+      slot = &this->store_;
       break;
     }
-    if (all_dimmer->zero_cross_pin_number == this->zero_cross_pin_->get_pin()) {
+    if (slot->zero_cross_pin_number == this->zero_cross_pin_->get_pin()) {
       setup_zero_cross_pin = false;
     }
   }
 
+  // ── Gate pin ─────────────────────────────────────────────────────────────
   this->gate_pin_->setup();
-  this->store_.gate_pin = this->gate_pin_->to_isr();
+  this->store_.gate_pin            = this->gate_pin_->to_isr();
   this->store_.zero_cross_pin_number = this->zero_cross_pin_->get_pin();
-  this->store_.min_power = static_cast<uint16_t>(this->min_power_ * 1000);
-  this->min_power_ = 0;
-  this->store_.method = this->method_;
-  this->store_.zc_method = this->zc_method_;
+
+  // ── Store configuration ──────────────────────────────────────────────────
+  this->store_.min_power           = static_cast<uint16_t>(this->min_power_ * 1000);
+  this->min_power_                 = 0;
+  this->store_.method              = this->method_;
+  this->store_.zc_method           = this->zc_method_;
   this->store_.half_cycle_offset_us = this->half_cycle_offset_us_;
 
+  // ── Initialise timer-related fields ─────────────────────────────────────
+  this->store_.value               = 0;
+  this->store_.cycle_time_us       = 0;
+  this->store_.last_zc_time        = 0;
+  this->store_.init_cycle_count    = 0;
+#ifdef USE_ESP32
+  this->store_.enable_timer        = nullptr;
+  this->store_.disable_timer       = nullptr;
+  this->store_.pending_disable_us  = GATE_ENABLE_TIME;
+#endif
+
+  // ── ZC pin interrupt (first dimmer on this pin only) ─────────────────────
   if (setup_zero_cross_pin) {
-    // Only call setup() and attach the interrupt once, for the dimmer that owns the ZC pin.
-    // Calling setup() a second time (for a shared-pin dimmer) resets GPIO config and clears
-    // the interrupt already attached by the first dimmer, killing all output.
     this->zero_cross_pin_->setup();
-    // Select interrupt mode based on configured zc_method:
-    //   edges          → ANY_EDGE:     sustained-level ZCD (H11A1-based). Both edges = ZC.
-    //   pulse          → FALLING_EDGE: active-low narrow pulse (upstream ac_dimmer default).
-    //   inverted_pulse → RISING_EDGE:  active-high narrow pulse.
     gpio::InterruptType intr_type;
     switch (this->zc_method_) {
       case ZC_METHOD_PULSE:
@@ -228,94 +297,101 @@ void AcDimmer::setup() {
         intr_type = gpio::INTERRUPT_ANY_EDGE;
         break;
     }
-    this->zero_cross_pin_->attach_interrupt(&AcDimmerDataStore::s_gpio_intr, &this->store_,
-                                            intr_type);
+    this->zero_cross_pin_->attach_interrupt(&AcDimmerDataStore::s_gpio_intr,
+                                            &this->store_, intr_type);
   }
-  // Always initialize zero_cross_pin in the store, even for shared-pin dimmers that do not
-  // own the interrupt. gpio_intr() calls digital_read() on this field to identify the
-  // half-cycle polarity — it must be valid for every dimmer instance.
-  // to_isr() is a pure handle conversion with no hardware side effects, safe to call
-  // on an already-configured pin without disturbing the interrupt attachment.
+  // Always initialise zero_cross_pin ISR handle — gpio_intr() calls digital_read()
+  // on it for half-cycle polarity detection even on shared-pin dimmers.
   this->store_.zero_cross_pin = this->zero_cross_pin_->to_isr();
 
-#ifdef USE_ESP8266
-  setTimer1Callback(&timer_interrupt);
-#endif
 #ifdef USE_ESP32
-  if (dimmer_timer == nullptr) {
-    dimmer_timer = timer_begin(TIMER_FREQUENCY_HZ);
-    if (dimmer_timer == nullptr) {
-      ESP_LOGE(TAG, "Failed to create GPTimer for AC dimmer");
+  // ── Create per-channel esp_timer one-shots ───────────────────────────────
+  // Two timers per channel — no shared global timer, no polling.
+  // dispatch_method: ESP_TIMER_ISR gives ~1 µs callback latency when the IDF
+  // Kconfig option CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD is enabled
+  // (requires manually adding it to sdkconfig.esphome or using IDF >= 5.1 with
+  // Arduino Core >= 3.x built with that option). Falls back to ESP_TIMER_TASK
+  {
+    esp_timer_create_args_t args = {};
+    args.dispatch_method         = DIMMER_TIMER_DISPATCH;
+    args.skip_unhandled_events   = false;
+
+    args.callback                = &AcDimmerDataStore::enable_timer_cb;
+    args.arg                     = &this->store_;
+    args.name                    = "dimmer_en";
+    esp_err_t err = esp_timer_create(&args, &this->store_.enable_timer);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to create enable_timer (err %d)", err);
       this->mark_failed();
       return;
     }
-    timer_attach_interrupt(dimmer_timer, &AcDimmerDataStore::s_timer_intr);
-    timer_alarm(dimmer_timer, TIMER_INTERVAL_US, true, 0);
+
+    args.callback                = &AcDimmerDataStore::disable_timer_cb;
+    args.name                    = "dimmer_dis";
+    err = esp_timer_create(&args, &this->store_.disable_timer);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to create disable_timer (err %d)", err);
+      esp_timer_delete(this->store_.enable_timer);
+      this->store_.enable_timer = nullptr;
+      this->mark_failed();
+      return;
+    }
   }
 #endif
 }
 
-void AcDimmer::write_state(float state) {
-  // State arrives here after FloatOutput remaps it: state = min_power + raw*(max_power-min_power).
-  // With gamma_correct: 0 (or 1) on the light entity and typical min_power=0.005, max_power=1.0,
-  // state at slider=99% ≈ 0.990 and state at slider=100% == max_power_ (1.0) exactly.
-  //
-  // GAMMA NOTE: the acos RMS compensation below corrects the nonlinear relationship between
-  // conduction angle and RMS power — it is NOT gamma correction. Gamma correction (applied
-  // by the light component before calling write_state) shifts the state into a different space:
-  // e.g. gamma=2.8 maps slider 90% → state 0.73, so threshold 0.9 is never reached and
-  // threshold 0.5 triggers at slider ~78% instead of 50%.
-  // Set gamma_correct: 0 or gamma_correct: 1 on the light entity to disable gamma and make
-  // threshold comparisons match the HA slider position directly.
-  //
-  // RMS CORRECTION NOTE (rms_correction option):
-  // The acos transform corrects for the nonlinear relationship between phase-angle conduction
-  // and RMS power, which is appropriate for resistive/incandescent loads (brightness ∝ power).
-  // For LED lamps with constant-current switching drivers, brightness is proportional to
-  // conduction fraction (linear) — acos over-corrects and makes dimming less accurate.
-  // Set rms_correction: false for LED loads.
+// ── write_state() ─────────────────────────────────────────────────────────────
 
+void AcDimmer::write_state(float state) {
   uint16_t new_value;
 
-  auto apply_compensation = [&](float s) -> uint16_t {
-    if (this->rms_correction_) {
-      s = std::acos(1 - (2 * s)) / std::numbers::pi;
+  // apply_curve: maps a normalised brightness value [0,1] through the selected
+  // curve, then converts to the 0–65535 internal scale.
+  //
+  // DIM_CURVE_RMS:
+  //   acos(1 − 2s)/π — corrects the nonlinear relationship between phase-angle
+  //   conduction fraction and delivered RMS power. Appropriate for resistive /
+  //   incandescent loads where perceived brightness ~ RMS power.
+  //
+  // DIM_CURVE_LINEAR:
+  //   Identity. Conduction fraction equals the normalised slider value directly.
+  //   Use when the load already linearises (or for diagnostic / testing purposes).
+  //
+  // DIM_CURVE_LOGARITHMIC:
+  //   log₁₀(1 + 9·s) — perceptual curve that allocates more dimmer steps to the
+  //   low-brightness region where the eye is most sensitive. Best for LED loads
+  //   with constant-current switching drivers, whose brightness is already linear
+  //   with conduction fraction (making the acos RMS curve over-compensate).
+  //   Formula from IES perceptual linearisation literature.
+  auto apply_curve = [&](float s) -> uint16_t {
+    switch (this->curve_) {
+      case DIM_CURVE_RMS:
+        s = std::acos(1.0f - (2.0f * s)) / static_cast<float>(std::numbers::pi);
+        break;
+      case DIM_CURVE_LOGARITHMIC:
+        s = std::log10(1.0f + 9.0f * s);  // maps [0,1] → [0,1], log-distributed
+        break;
+      case DIM_CURVE_LINEAR:
+      default:
+        break;  // s unchanged
     }
-    return static_cast<uint16_t>(roundf(s * 65535));
+    return static_cast<uint16_t>(roundf(s * 65535.0f));
   };
 
   if (state == 0.0f) {
-    // Fully off.
     new_value = 0;
 
   } else if (this->max_flat_threshold_ > 0.0f) {
-    // Flat zone mode: the dimmable range [min_power, max_flat_threshold] is compressed
-    // to fill slider positions 1–99%, and slider 100% (state == max_power_) jumps to
-    // max_power (full conduction). This gives the UI a full 1–100% range regardless of
-    // where max_flat_threshold is set.
-    //
-    // FloatOutput guarantees state == max_power_ at slider=100% (since
-    // state = min_power + 1.0*(max_power-min_power) = max_power). A small epsilon
-    // guards against float rounding in the remapping below.
+    // Flat zone mode: slider 1–99% spans [min_power, max_flat_threshold];
+    // slider 100% (state == max_power_) jumps directly to max_power_.
     if (state >= this->max_power_ - 1e-5f) {
-      // Slider at 100%: jump to max_power.
-      // max_power_ == 1.0 → 65535 → gpio_intr holds gate high for the full half-cycle,
-      // zero switching losses. Otherwise apply RMS compensation to the capped level.
-      if (this->max_power_ >= 1.0f) {
-        new_value = 65535;
-      } else {
-        new_value = apply_compensation(this->max_power_);
-      }
+      new_value = (this->max_power_ >= 1.0f) ? 65535 : apply_curve(this->max_power_);
     } else {
-      // Slider 1–99%: remap state from [0, max_power_] to [0, max_flat_threshold_] so
-      // the entire dimmable range spans the slider linearly.
       float remapped = (state / this->max_power_) * this->max_flat_threshold_;
-      new_value = apply_compensation(remapped);
+      new_value      = apply_curve(remapped);
     }
-
   } else {
-    // No flat zone: standard dimming across full [0, max_power_] range.
-    new_value = apply_compensation(state);
+    new_value = apply_curve(state);
   }
 
   if (new_value != 0 && this->store_.value == 0)
@@ -323,43 +399,57 @@ void AcDimmer::write_state(float state) {
   this->store_.value = new_value;
 }
 
+// ── dump_config() ─────────────────────────────────────────────────────────────
+
 void AcDimmer::dump_config() {
   ESP_LOGCONFIG(TAG,
-                "EdgeAcDimmer:\n"
-                "   Min Power: %.3f\n"
-                "   Max Power: %.3f\n"
-                "   Init half-cycles: %u\n"
-                "   RMS correction: %s\n"
-                "   Max flat threshold: %s (%.3f)",
+                "AdvancedAcDimmer (esp_timer one-shot, flicker-free):\n"
+                "  Min Power: %.3f\n"
+                "  Max Power: %.3f\n"
+                "  Init half-cycles: %u\n"
+                "  Curve: %s\n"
+                "  Max flat threshold: %s (%.3f)\n"
+                "  Timer dispatch: %s",
                 this->store_.min_power / 1000.0f,
                 this->max_power_,
                 this->init_with_n_half_cycles_,
-                YESNO(this->rms_correction_),
+                this->curve_ == DIM_CURVE_RMS         ? "rms"         :
+                this->curve_ == DIM_CURVE_LOGARITHMIC ? "logarithmic" : "linear",
                 this->max_flat_threshold_ > 0.0f ? "enabled" : "disabled",
-                this->max_flat_threshold_);
+                this->max_flat_threshold_,
+#ifdef CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
+                "ESP_TIMER_ISR (~1 µs)"
+#else
+                "ESP_TIMER_TASK (~10-50 µs, enable CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD for best jitter)"
+#endif
+  );
   LOG_PIN("  Output Pin: ", this->gate_pin_);
   LOG_PIN("  Zero-Cross Pin: ", this->zero_cross_pin_);
-  if (method_ == DIM_METHOD_LEADING_PULSE) {
-    ESP_LOGCONFIG(TAG, "   Dim method: leading pulse");
-  } else if (method_ == DIM_METHOD_LEADING) {
-    ESP_LOGCONFIG(TAG, "   Dim method: leading");
-  } else {
-    ESP_LOGCONFIG(TAG, "   Dim method: trailing");
-  }
-  if (zc_method_ == ZC_METHOD_PULSE) {
-    ESP_LOGCONFIG(TAG, "   ZC method: pulse (falling edge)");
-  } else if (zc_method_ == ZC_METHOD_INVERTED_PULSE) {
-    ESP_LOGCONFIG(TAG, "   ZC method: inverted pulse (rising edge)");
-  } else {
-    ESP_LOGCONFIG(TAG, "   ZC method: edges (any edge)");
-  }
+
+  const char *method_str =
+      this->method_ == DIM_METHOD_LEADING_PULSE ? "leading pulse" :
+      this->method_ == DIM_METHOD_LEADING        ? "leading"       : "trailing";
+  ESP_LOGCONFIG(TAG, "  Dim method: %s", method_str);
+
+  const char *zc_str =
+      this->zc_method_ == ZC_METHOD_PULSE          ? "pulse (falling edge)"         :
+      this->zc_method_ == ZC_METHOD_INVERTED_PULSE  ? "inverted pulse (rising edge)" :
+                                                       "edges (any edge)";
+  ESP_LOGCONFIG(TAG, "  ZC method: %s", zc_str);
+
   if (this->half_cycle_offset_us_ != 0) {
-    ESP_LOGCONFIG(TAG, "   Half-cycle offset: %d µs (applied to odd half-cycles)", this->half_cycle_offset_us_);
+    ESP_LOGCONFIG(TAG, "  Half-cycle offset: %d µs", this->half_cycle_offset_us_);
   } else {
-    ESP_LOGCONFIG(TAG, "   Half-cycle offset: disabled");
+    ESP_LOGCONFIG(TAG, "  Half-cycle offset: disabled");
   }
+
   LOG_FLOAT_OUTPUT(this);
-  ESP_LOGV(TAG, "  Estimated Frequency: %.3fHz", 1e6f / this->store_.cycle_time_us / 2);
+
+  if (this->store_.cycle_time_us > 0) {
+    ESP_LOGV(TAG, "  Measured half-cycle: %" PRIu32 " µs  (%.2f Hz)",
+             this->store_.cycle_time_us,
+             1e6f / static_cast<float>(this->store_.cycle_time_us));
+  }
 }
 
 }  // namespace esphome::advanced_ac_dimmer

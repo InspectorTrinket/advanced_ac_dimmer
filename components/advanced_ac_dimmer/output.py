@@ -4,7 +4,7 @@ from esphome import pins
 from esphome.components import output
 from esphome.const import CONF_ID, CONF_METHOD, CONF_MIN_POWER
 
-CODEOWNERS = ["@victorvation"]
+CODEOWNERS = ["@InspectorTrinket"]
 
 DEPENDENCIES = ["output"]
 
@@ -13,11 +13,12 @@ AcDimmer = advanced_ac_dimmer_ns.class_("AcDimmer", output.FloatOutput, cg.Compo
 
 DimMethod = advanced_ac_dimmer_ns.enum("DimMethod")
 ZcMethod = advanced_ac_dimmer_ns.enum("ZcMethod")
+DimCurve = advanced_ac_dimmer_ns.enum("DimCurve")
 
 # Dimming methods — controls how the gate pin is driven relative to zero crossing:
-#   leading_pulse : brief gate pulse at start of half-cycle. TRIAC only. Default.
-#   leading       : gate held high from start of half-cycle. TRIAC only.
-#   trailing      : gate held high from zero cross until dim point. Back-to-back MOSFET only.
+#   leading_pulse : Brief gate pulse at dim point. TRIAC conducts until zero crossing. TRIAC (default).
+#   leading       : Gate held high from dim point until end of half-cycle. MOSFET mimicking TRIAC operation.
+#   trailing      : Gate held high from start of half-cycle until dim point. Back-to-back MOSFET.
 DIM_METHODS = {
     "leading_pulse": DimMethod.DIM_METHOD_LEADING_PULSE,
     "leading": DimMethod.DIM_METHOD_LEADING,
@@ -25,25 +26,35 @@ DIM_METHODS = {
 }
 
 # Zero crossing detection methods — select to match your ZCD circuit:
-#   edges          : INTERRUPT_ANY_EDGE. Sustained-level circuit (e.g. H11A1-based:
-#                    0V on positive half-cycle, 3.3V on negative half-cycle).
+#   edges          : INTERRUPT_ANY_EDGE. Sustained-level circuit — 0V on positive half-cycle, Vcc on negative (60 Hz Square Wave).
 #                    Both rising and falling edges represent zero crossings. Default.
-#   pulse          : INTERRUPT_FALLING_EDGE. Active-low narrow pulse at each ZC.
-#                    Equivalent to the original upstream ac_dimmer behaviour.
-#   inverted_pulse : INTERRUPT_RISING_EDGE. Active-high narrow pulse at each ZC.
+#   pulse          : INTERRUPT_FALLING_EDGE. Active-low narrow pulse at each zero crossing (120 Hz low pulse train).
+#   inverted_pulse : INTERRUPT_RISING_EDGE. Active-high narrow pulse at each zero crossing (120 Hz high pulse train). |
 ZC_METHODS = {
     "edges": ZcMethod.ZC_METHOD_EDGES,
     "pulse": ZcMethod.ZC_METHOD_PULSE,
     "inverted_pulse": ZcMethod.ZC_METHOD_INVERTED_PULSE,
 }
 
+# Brightness-to-conduction-angle mapping curve:
+#   rms         : acos(1-2s)/π compensation. Correct for incandescent/resistive loads
+#                 where brightness ∝ RMS power. Default.
+#   linear      : no compensation. Conduction fraction maps directly to value.
+#   logarithmic : log₁₀(1+9s) perceptual curve. Best for LED loads with constant-current
+#                 drivers where brightness is already linear with conduction fraction.
+DIM_CURVE_OPTIONS = {
+    "rms":         DimCurve.DIM_CURVE_RMS,
+    "linear":      DimCurve.DIM_CURVE_LINEAR,
+    "logarithmic": DimCurve.DIM_CURVE_LOGARITHMIC,
+}
+
 CONF_ZERO_CROSS_PIN = "zero_cross_pin"
 CONF_GATE_PIN = "gate_pin"
 CONF_INIT_WITH_N_HALF_CYCLES = "init_with_n_half_cycles"
 CONF_MAX_FLAT_THRESHOLD = "max_flat_threshold"
-CONF_RMS_CORRECTION = "rms_correction"
 CONF_ZC_METHOD = "zc_method"
 CONF_HALF_CYCLE_OFFSET = "half_cycle_offset"
+CONF_CURVE = "curve"
 
 
 def validate_flat_zone(config):
@@ -71,36 +82,33 @@ CONFIG_SCHEMA = cv.All(
             ),
 
             # Zero crossing detection method — select based on your ZCD circuit.
-            # edges (default) covers H11A1-based sustained-level circuits.
             cv.Optional(CONF_ZC_METHOD, default="edges"): cv.enum(
                 ZC_METHODS, lower=True
             ),
 
             # Kickstart: number of full half-cycles at full conduction on turn-on.
             # Helps LED drivers that need sustained power before they will start.
-            # 0 = disabled (default). 1 = equivalent to upstream init_with_half_cycle: true.
+            # 0 = disabled (default).
             cv.Optional(CONF_INIT_WITH_N_HALF_CYCLES, default=0): cv.int_range(
                 min=0, max=255
             ),
 
-            # RMS power compensation via acos transform.
-            # true (default): correct for incandescent/resistive loads (brightness ∝ RMS power).
-            # false: better for LED lamps with constant-current drivers (brightness ∝ conduction
-            #        fraction, which is already linear — acos over-corrects for these loads).
-            cv.Optional(CONF_RMS_CORRECTION, default=True): cv.boolean,
+            # Brightness curve — controls how the normalised brightness value is
+            # mapped to a conduction angle before being written to the dimmer.
+            cv.Optional(CONF_CURVE, default="rms"): cv.enum(
+                DIM_CURVE_OPTIONS, lower=True
+            ),
 
             # Flat zone threshold (0.01–0.99). When set, the dimmable range is compressed
             # into slider positions 1–99%, and slider 100% jumps directly to max_power.
             # Eliminates the dead zone where the MOSFET switches but lamp output is
             # perceptually identical to maximum, reducing heat and switching losses.
-            # Requires gamma_correct: 0 (or 1) on the light entity — see README.
+            # Requires gamma_correct: 0 (or 1) on the light entity.
             cv.Optional(CONF_MAX_FLAT_THRESHOLD): cv.float_range(min=0.01, max=0.99),
             # Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th)
-            # mismatch in back-to-back MOSFET topologies. Causes asymmetric conduction windows
-            # on positive vs negative half-cycles, visible as flicker on capacitorless loads.
+            # mismatch in back-to-back MOSFET topologies.
             # Positive: extends odd half-cycle conduction. Negative: shortens it.
             # Tune empirically with an oscilloscope until both half-cycles match.
-            # Only effective with method: trailing. Default 0 (disabled).
             cv.Optional(CONF_HALF_CYCLE_OFFSET, default=0): cv.int_range(min=-500, max=500),
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -123,7 +131,7 @@ async def to_code(config):
     cg.add(var.set_zc_method(config[CONF_ZC_METHOD]))
     cg.add(var.set_half_cycle_offset(config[CONF_HALF_CYCLE_OFFSET]))
     cg.add(var.set_init_with_n_half_cycles(config[CONF_INIT_WITH_N_HALF_CYCLES]))
-    cg.add(var.set_rms_correction(config[CONF_RMS_CORRECTION]))
+    cg.add(var.set_curve(config[CONF_CURVE]))
 
     if CONF_MAX_FLAT_THRESHOLD in config:
         cg.add(var.set_max_flat_threshold(config[CONF_MAX_FLAT_THRESHOLD]))
