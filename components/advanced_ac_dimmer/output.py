@@ -55,6 +55,7 @@ CONF_MAX_FLAT_THRESHOLD = "max_flat_threshold"
 CONF_ZC_METHOD = "zc_method"
 CONF_HALF_CYCLE_OFFSET = "half_cycle_offset"
 CONF_CURVE = "curve"
+CONF_KICKSTART_THRESHOLD = "kickstart_threshold"
 
 
 def validate_flat_zone(config):
@@ -105,6 +106,14 @@ CONFIG_SCHEMA = cv.All(
             # perceptually identical to maximum, reducing heat and switching losses.
             # Requires gamma_correct: 0 (or 1) on the light entity.
             cv.Optional(CONF_MAX_FLAT_THRESHOLD): cv.float_range(min=0.01, max=0.99),
+            # Kickstart threshold (0.01–0.99). When set, kickstart is suppressed for
+            # target brightness at or above this value — the lamp self-starts reliably
+            # at those levels without a full-power flash. Compared against the raw
+            # slider position (0.0–1.0) before curve compensation.
+            # Transition-aware: if a transition crosses the threshold while kickstart
+            # is active, kickstart is cancelled at that moment seamlessly.
+            cv.Optional(CONF_KICKSTART_THRESHOLD): cv.float_range(min=0.01, max=0.99),
+
             # Signed µs offset applied to alternate half-cycles to compensate MOSFET Vgs(th)
             # mismatch in back-to-back MOSFET topologies.
             # Positive: extends odd half-cycle conduction. Negative: shortens it.
@@ -132,6 +141,9 @@ async def to_code(config):
     cg.add(var.set_half_cycle_offset(config[CONF_HALF_CYCLE_OFFSET]))
     cg.add(var.set_init_with_n_half_cycles(config[CONF_INIT_WITH_N_HALF_CYCLES]))
     cg.add(var.set_curve(config[CONF_CURVE]))
+
+    if CONF_KICKSTART_THRESHOLD in config:
+        cg.add(var.set_kickstart_threshold(config[CONF_KICKSTART_THRESHOLD]))
 
     if CONF_MAX_FLAT_THRESHOLD in config:
         cg.add(var.set_max_flat_threshold(config[CONF_MAX_FLAT_THRESHOLD]))

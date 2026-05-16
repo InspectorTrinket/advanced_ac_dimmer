@@ -120,15 +120,25 @@ void IRAM_ATTR HOT AcDimmerDataStore::gpio_intr() {
 
   // Kickstart: drive gate high for the full half-cycle to charge LED driver caps.
   if (this->init_cycle_count > 0) {
-    this->init_cycle_count--;
-    this->gate_pin.digital_write(true);
-    // Arm disable_timer to pull gate LOW at end of half-cycle.
-    // If cycle_time_us is not yet known (very first ZC), skip — the next ZC's
-    // pass 1 will clear the gate.
-    if (this->cycle_time_us > 0) {
-      esp_timer_start_once(this->disable_timer, this->cycle_time_us);
+    // Cancel kickstart if value has risen above the threshold during a transition.
+    // write_state() updates store_.value at the ESPHome loop rate (~60 Hz); gpio_intr()
+    // checks here at 120 Hz, so cancellation happens within one half-cycle (8.33 ms)
+    // of write_state() committing a value above the threshold — far faster than relying
+    // on write_state() alone, which would miss the window for long transitions.
+    if (this->kickstart_threshold_value > 0 && this->value >= this->kickstart_threshold_value) {
+      this->init_cycle_count = 0;
+      // Fall through to normal phase-angle dimming below.
+    } else {
+      this->init_cycle_count--;
+      this->gate_pin.digital_write(true);
+      // Arm disable_timer to pull gate LOW at end of half-cycle.
+      // If cycle_time_us is not yet known (very first ZC), skip — the next ZC's
+      // pass 1 will clear the gate.
+      if (this->cycle_time_us > 0) {
+        esp_timer_start_once(this->disable_timer, this->cycle_time_us);
+      }
+      return;
     }
-    return;
   }
 
   // Fully off or no timing data yet: gate stays LOW (already done in pass 1).
@@ -394,8 +404,31 @@ void AcDimmer::write_state(float state) {
     new_value = apply_curve(state);
   }
 
-  if (new_value != 0 && this->store_.value == 0)
+  // ── Kickstart threshold logic ────────────────────────────────────────────
+  // Threshold is evaluated against the raw state (pre-curve slider position)
+  // so the configured value matches the HA slider percentage directly.
+  //
+  // Pre-compute the curve-transformed threshold value so gpio_intr() can
+  // compare against store_.value (which is post-curve) without floating-point.
+  // Written every call but constant — gpio_intr() uses it to cancel kickstart
+  // within one half-cycle of store_.value crossing the threshold.
+  //
+  // ARM (turning on from off): suppress kickstart immediately when the target
+  // is already above threshold — handles instant turn-on with no transition.
+  // For transitions the first write_state call carries a tiny interpolated
+  // value below the threshold, so kickstart arms; gpio_intr() cancels it
+  // within 8.33 ms of store_.value rising above kickstart_threshold_value.
+  if (this->kickstart_threshold_ > 0.0f) {
+    this->store_.kickstart_threshold_value = apply_curve(this->kickstart_threshold_);
+  }
+
+  bool above_threshold = (this->kickstart_threshold_ > 0.0f &&
+                          state >= this->kickstart_threshold_);
+
+  if (new_value != 0 && this->store_.value == 0 && !above_threshold) {
     this->store_.init_cycle_count = this->init_with_n_half_cycles_;
+  }
+
   this->store_.value = new_value;
 }
 
@@ -407,12 +440,15 @@ void AcDimmer::dump_config() {
                 "  Min Power: %.3f\n"
                 "  Max Power: %.3f\n"
                 "  Init half-cycles: %u\n"
+                "  Kickstart threshold: %s (%.2f)\n"
                 "  Curve: %s\n"
                 "  Max flat threshold: %s (%.3f)\n"
                 "  Timer dispatch: %s",
                 this->store_.min_power / 1000.0f,
                 this->max_power_,
                 this->init_with_n_half_cycles_,
+                this->kickstart_threshold_ > 0.0f ? "enabled" : "disabled",
+                this->kickstart_threshold_,
                 this->curve_ == DIM_CURVE_RMS         ? "rms"         :
                 this->curve_ == DIM_CURVE_LOGARITHMIC ? "logarithmic" : "linear",
                 this->max_flat_threshold_ > 0.0f ? "enabled" : "disabled",

@@ -80,6 +80,10 @@ struct AcDimmerDataStore {
   volatile uint32_t cycle_time_us;   ///< Last measured half-cycle duration [µs]
   volatile int64_t  last_zc_time;    ///< esp_timer_get_time() at last valid ZC [µs]
   volatile uint8_t  init_cycle_count;///< Kickstart half-cycles remaining; 0 = inactive
+  /// Pre-computed curve-transformed kickstart threshold for ISR comparison.
+  /// 0 = threshold disabled. Written once by write_state(); read by gpio_intr()
+  /// to cancel kickstart as soon as value rises above it during a transition.
+  volatile uint16_t kickstart_threshold_value{0};
 
   // ── Per-channel esp_timer one-shots (created once in setup()) ────────────
 #ifdef USE_ESP32
@@ -125,6 +129,16 @@ class AcDimmer : public output::FloatOutput, public Component {
   /// from off. 0 disables kickstart. 1 is equivalent to upstream init_with_half_cycle.
   void set_init_with_n_half_cycles(uint8_t n) { init_with_n_half_cycles_ = n; }
 
+  /// Kickstart threshold (0.0 = disabled). Kickstart is suppressed when the target
+  /// brightness is at or above this value — the lamp self-starts reliably at those
+  /// levels without a full-power flash. Expressed as a normalised slider position
+  /// (0.0–1.0), compared against the raw state before curve compensation.
+  ///
+  /// Transition-aware: if a transition brings the brightness through the threshold
+  /// during kickstart, kickstart is cancelled at the moment the threshold is crossed.
+  /// The lamp is already conducting at that point so the cancellation is seamless.
+  void set_kickstart_threshold(float threshold) { kickstart_threshold_ = threshold; }
+
   void set_method(DimMethod method) { method_ = method; }
 
   /// Flat zone threshold (0.0 = disabled). Slider 100% jumps to max_power_;
@@ -151,6 +165,7 @@ class AcDimmer : public output::FloatOutput, public Component {
   InternalGPIOPin *zero_cross_pin_;
   AcDimmerDataStore store_;
   uint8_t init_with_n_half_cycles_{0};
+  float   kickstart_threshold_{0.0f};  ///< 0.0 = disabled (kickstart always fires)
   float   max_flat_threshold_{0.0f};
   DimCurve curve_{DIM_CURVE_RMS};
   ZcMethod zc_method_{ZC_METHOD_EDGES};
