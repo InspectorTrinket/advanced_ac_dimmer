@@ -8,7 +8,7 @@ and flicker-free operation matter.
 
 | Feature | Description |
 |---|---|
-| Flicker-free timer architecture | `esp_timer` one-shot pairs per channel, hard-synced to zero-crossing |
+| Flicker-free timer architecture | `esp_timer` one-shot pair per channel, hard-synced to zero-crossing |
 | Zero crossing detection | `edges` / `pulse` / `inverted_pulse` — matches any ZCD circuit |
 | Brightness curve | `rms` / `linear` / `logarithmic` — select per load type |
 | Multi-half-cycle kickstart | Configurable count for LED drivers that need sustained power to ignite |
@@ -149,6 +149,7 @@ output:
     zc_method: edges             # edges | pulse | inverted_pulse
     curve: rms                   # rms | linear | logarithmic
     init_with_n_half_cycles: 10  # 0–255, default 0
+    kickstart_threshold: 0.10    # 0.01–0.99, optional
     min_power: 0.01              # 0.0–1.0, default 0.0
     max_power: 1.0               # 0.0–1.0, default 1.0
     max_flat_threshold: 0.63     # 0.01–0.99, optional
