@@ -158,6 +158,14 @@ class AcDimmer : public output::FloatOutput, public Component {
   /// mismatch. Range ±500µs. Tune with oscilloscope.
   void set_half_cycle_offset(int16_t offset_us) { half_cycle_offset_us_ = offset_us; }
 
+  /// Return the measured mains frequency in Hz, derived from the last two
+  /// zero-crossing edges. Returns 0.0 if no zero-crossing has been detected yet.
+  float get_frequency_hz() const {
+    uint32_t t = this->store_.cycle_time_us;
+    if (t == 0) return 0.0f;
+    return 1000000.0f / (2.0f * static_cast<float>(t));
+  }
+
  protected:
   void write_state(float state) override;
 
