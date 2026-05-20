@@ -237,6 +237,26 @@ Increase the value until the lamp ignites reliably on every turn-on.
 
 ---
 
+### `kickstart_threshold`
+Suppresses kickstart when the target brightness is at or above this value. Above the
+threshold the lamp self-starts reliably from the phase-angle conduction alone — no
+full-power flash is needed.
+
+Expressed as a normalised slider position (0.01–0.99), compared against the raw state
+before curve compensation. `kickstart_threshold: 0.17` means the HA slider at 17% or above.
+
+**Transition-aware:** if a transition ramps the brightness upward through the threshold
+while kickstart is still counting down, kickstart is cancelled at the crossing point. The
+lamp is already conducting at that brightness level so the cancellation is seamless.
+
+**Tuning procedure:**
+1. With `init_with_n_half_cycles: 0` (kickstart disabled), find the lowest slider position
+   at which the lamp turns on reliably from off
+2. Set `kickstart_threshold` to that value
+3. Re-enable `init_with_n_half_cycles` — kickstart will now only fire below the threshold
+
+---
+
 ### `max_flat_threshold`
 Eliminates the flat zone — the region near maximum brightness where the lamp output is
 perceptually indistinguishable from full on, but the MOSFET is still switching, generating 
@@ -287,6 +307,36 @@ Range: −500 to +500 µs. Default: 0 (disabled).
 Inherited from the `FloatOutput` base class. Clamp the effective output range.
 `max_power` is also the jump target when `max_flat_threshold` is set and the slider is
 at 100%.
+
+---
+
+## Diagnostics
+
+### Mains frequency sensor
+
+The component measures the mains half-cycle duration on every zero-crossing and exposes
+it via `get_frequency_hz()`. Use this to diagnose ZCD circuit issues — frequency glitches,
+loss of sync, or spurious edges show up immediately as deviations from 60 Hz (or 50 Hz).
+
+Add to your YAML `sensor:` section:
+
+```yaml
+sensor:
+  - platform: template
+    name: "Mains Frequency"
+    device_class: frequency
+    state_class: measurement
+    unit_of_measurement: Hz
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(dimmer1).get_frequency_hz();
+```
+
+Returns `0.0` until the first zero-crossing is detected. When a glitch occurs, watch for
+the frequency jumping away from the nominal value, dropping to 0, or oscillating — this
+identifies whether the ZCD circuit is losing signal, generating spurious edges, or simply
+producing noise that the 3 ms debounce is catching intermittently.
 
 ---
 
