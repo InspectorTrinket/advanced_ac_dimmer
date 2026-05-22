@@ -249,6 +249,10 @@ before curve compensation. `kickstart_threshold: 0.17` means the HA slider at 17
 while kickstart is still counting down, kickstart is cancelled at the crossing point. The
 lamp is already conducting at that brightness level so the cancellation is seamless.
 
+**Kickstart re-arm guard:** kickstart only re-arms after a genuine off command
+(`write_state(0)`), not after momentary zero pulses from HA state restoration, WiFi
+reconnection, or script races. This prevents spurious full-power bursts during operation.
+
 **Tuning procedure:**
 1. With `init_with_n_half_cycles: 0` (kickstart disabled), find the lowest slider position
    at which the lamp turns on reliably from off
@@ -316,7 +320,7 @@ at 100%.
 
 The component measures the mains half-cycle duration on every zero-crossing and exposes
 it via `get_frequency_hz()`. Use this to diagnose ZCD circuit issues — frequency glitches,
-loss of sync, or spurious edges show up immediately as deviations from 60 Hz (or 50 Hz).
+loss of sync, or spurious edges show up immediately as deviations from the nominal value.
 
 Add to your YAML `sensor:` section:
 
@@ -337,6 +341,21 @@ Returns `0.0` until the first zero-crossing is detected. When a glitch occurs, w
 the frequency jumping away from the nominal value, dropping to 0, or oscillating — this
 identifies whether the ZCD circuit is losing signal, generating spurious edges, or simply
 producing noise that the 3 ms debounce is catching intermittently.
+
+### Kickstart arm logging
+
+When the logger level for `advanced_ac_dimmer` is set to `DEBUG`, the component logs every
+kickstart arm event:
+
+```yaml
+logger:
+  level: INFO
+  logs:
+    advanced_ac_dimmer: DEBUG
+```
+
+This is useful to verify kickstart only fires on genuine turn-on events and not spuriously
+during operation.
 
 ---
 
