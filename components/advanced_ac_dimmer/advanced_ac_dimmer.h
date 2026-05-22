@@ -80,10 +80,10 @@ struct AcDimmerDataStore {
   volatile uint32_t cycle_time_us;   ///< Last measured half-cycle duration [µs]
   volatile int64_t  last_zc_time;    ///< esp_timer_get_time() at last valid ZC [µs]
   volatile uint8_t  init_cycle_count;///< Kickstart half-cycles remaining; 0 = inactive
-  /// True only after write_state(0) has been called and confirmed — i.e. the output
-  /// was explicitly commanded off, not just momentarily zero due to a state glitch.
-  /// Kickstart only arms when transitioning from this confirmed-off state, preventing
-  /// spurious kickstart from brief zero pulses during HA reconnection or state races.
+  /// True after a genuine write_state(0) — i.e. the output was explicitly commanded
+  /// off. Kickstart only arms on the first non-zero write after this confirmed-off
+  /// state, preventing spurious kickstart from brief zero pulses during HA
+  /// reconnection, state restoration, or script races.
   volatile bool     was_explicitly_off{true};  ///< true at boot so first turn-on arms kickstart
   /// Pre-computed curve-transformed kickstart threshold for ISR comparison.
   /// 0 = threshold disabled. Written once by write_state(); read by gpio_intr()

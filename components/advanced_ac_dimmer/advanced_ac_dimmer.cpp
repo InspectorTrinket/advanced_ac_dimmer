@@ -431,9 +431,6 @@ void AcDimmer::write_state(float state) {
     // This distinguishes a real off command from a momentary zero caused by
     // HA state restoration, WiFi reconnection glitches, or script races —
     // none of which should re-arm kickstart on the next non-zero write.
-    if (this->store_.value != 0) {
-      ESP_LOGW(TAG, "write_state(0) called while output was on (value=%u) — possible spurious off", this->store_.value);
-    }
     this->store_.was_explicitly_off = true;
   } else if (this->store_.was_explicitly_off && !above_threshold) {
     // Arm kickstart only on the first non-zero write after a confirmed off.
