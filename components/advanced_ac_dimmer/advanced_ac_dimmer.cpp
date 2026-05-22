@@ -285,6 +285,7 @@ void AcDimmer::setup() {
   this->store_.cycle_time_us       = 0;
   this->store_.last_zc_time        = 0;
   this->store_.init_cycle_count    = 0;
+  this->store_.was_explicitly_off  = true;  // first turn-on after boot arms kickstart
 #ifdef USE_ESP32
   this->store_.enable_timer        = nullptr;
   this->store_.disable_timer       = nullptr;
@@ -425,8 +426,20 @@ void AcDimmer::write_state(float state) {
   bool above_threshold = (this->kickstart_threshold_ > 0.0f &&
                           state >= this->kickstart_threshold_);
 
-  if (new_value != 0 && this->store_.value == 0 && !above_threshold) {
-    this->store_.init_cycle_count = this->init_with_n_half_cycles_;
+  if (new_value == 0) {
+    // Mark as explicitly off only when the output is commanded to zero.
+    // This distinguishes a real off command from a momentary zero caused by
+    // HA state restoration, WiFi reconnection glitches, or script races —
+    // none of which should re-arm kickstart on the next non-zero write.
+    if (this->store_.value != 0) {
+      ESP_LOGW(TAG, "write_state(0) called while output was on (value=%u) — possible spurious off", this->store_.value);
+    }
+    this->store_.was_explicitly_off = true;
+  } else if (this->store_.was_explicitly_off && !above_threshold) {
+    // Arm kickstart only on the first non-zero write after a confirmed off.
+    ESP_LOGD(TAG, "Kickstart armed (%u half-cycles)", this->init_with_n_half_cycles_);
+    this->store_.init_cycle_count   = this->init_with_n_half_cycles_;
+    this->store_.was_explicitly_off = false;
   }
 
   this->store_.value = new_value;
