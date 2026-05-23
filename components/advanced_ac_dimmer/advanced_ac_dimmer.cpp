@@ -432,10 +432,16 @@ void AcDimmer::write_state(float state) {
     // HA state restoration, WiFi reconnection glitches, or script races —
     // none of which should re-arm kickstart on the next non-zero write.
     this->store_.was_explicitly_off = true;
-  } else if (this->store_.was_explicitly_off && !above_threshold) {
-    // Arm kickstart only on the first non-zero write after a confirmed off.
-    ESP_LOGD(TAG, "Kickstart armed (%u half-cycles)", this->init_with_n_half_cycles_);
-    this->store_.init_cycle_count   = this->init_with_n_half_cycles_;
+  } else {
+    if (this->store_.was_explicitly_off && !above_threshold) {
+      // Arm kickstart only on the first non-zero write after a confirmed off,
+      // and only if the target brightness is below the kickstart threshold.
+      ESP_LOGD(TAG, "Kickstart armed (%u half-cycles)", this->init_with_n_half_cycles_);
+      this->store_.init_cycle_count = this->init_with_n_half_cycles_;
+    }
+    // Clear the flag on any non-zero write — including above-threshold turn-ons.
+    // Without this, dimming down through the threshold after an above-threshold
+    // turn-on would spuriously re-arm kickstart mid-session.
     this->store_.was_explicitly_off = false;
   }
 
