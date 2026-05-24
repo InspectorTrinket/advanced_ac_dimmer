@@ -286,6 +286,30 @@ void AcDimmer::setup() {
   this->store_.last_zc_time        = 0;
   this->store_.init_cycle_count    = 0;
   this->store_.was_explicitly_off  = true;  // first turn-on after boot arms kickstart
+
+  // Pre-compute kickstart threshold value in post-curve space so the ISR can
+  // compare against store_.value without floating-point. Computed once here —
+  // it is constant and must not be written from write_state() to avoid
+  // cache-line contention between the main task and the ISR.
+  if (this->kickstart_threshold_ > 0.0f) {
+    float min_p   = this->min_power_ == 0.0f
+                        ? this->store_.min_power / 1000.0f
+                        : this->min_power_;
+    float ceiling = (this->max_flat_threshold_ > 0.0f)
+                        ? this->max_flat_threshold_
+                        : this->max_power_;
+    float remapped = min_p + this->kickstart_threshold_ * (ceiling - min_p);
+    // Apply the same curve transform used in write_state().
+    if (this->curve_ == DIM_CURVE_RMS) {
+      remapped = std::acos(1.0f - (2.0f * remapped)) / static_cast<float>(std::numbers::pi);
+    } else if (this->curve_ == DIM_CURVE_LOGARITHMIC) {
+      remapped = std::log10(1.0f + 9.0f * remapped);
+    }
+    this->store_.kickstart_threshold_value =
+        static_cast<uint16_t>(roundf(remapped * 65535.0f));
+  } else {
+    this->store_.kickstart_threshold_value = 0;
+  }
 #ifdef USE_ESP32
   this->store_.enable_timer        = nullptr;
   this->store_.disable_timer       = nullptr;
@@ -408,21 +432,15 @@ void AcDimmer::write_state(float state) {
   // ── Kickstart threshold logic ────────────────────────────────────────────
   // Threshold is evaluated against the raw state (pre-curve slider position)
   // so the configured value matches the HA slider percentage directly.
-  //
-  // Pre-compute the curve-transformed threshold value so gpio_intr() can
-  // compare against store_.value (which is post-curve) without floating-point.
-  // Written every call but constant — gpio_intr() uses it to cancel kickstart
-  // within one half-cycle of store_.value crossing the threshold.
+  // kickstart_threshold_value is pre-computed once in setup() — writing it
+  // here on every call caused cache-line contention with the ISR reading it
+  // at 120 Hz, producing a perceptible kink when dimming through the threshold.
   //
   // ARM (turning on from off): suppress kickstart immediately when the target
   // is already above threshold — handles instant turn-on with no transition.
   // For transitions the first write_state call carries a tiny interpolated
   // value below the threshold, so kickstart arms; gpio_intr() cancels it
   // within 8.33 ms of store_.value rising above kickstart_threshold_value.
-  if (this->kickstart_threshold_ > 0.0f) {
-    this->store_.kickstart_threshold_value = apply_curve(this->kickstart_threshold_);
-  }
-
   bool above_threshold = (this->kickstart_threshold_ > 0.0f &&
                           state >= this->kickstart_threshold_);
 
