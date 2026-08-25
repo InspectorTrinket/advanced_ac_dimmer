@@ -258,15 +258,12 @@ void AcDimmer::setup() {
   // detach the interrupt already installed by the first, killing all output.
   bool setup_zero_cross_pin = true;
 
-  // Find the free slot but do not publish into it yet — see the publish
-  // step at the end of this function for why.
-  int free_slot = -1;
-  for (int i = 0; i < static_cast<int>(sizeof(all_dimmers) / sizeof(all_dimmers[0])); i++) {
-    if (all_dimmers[i] == nullptr) {
-      free_slot = i;
+  for (auto &slot : all_dimmers) {
+    if (slot == nullptr) {
+      slot = &this->store_;
       break;
     }
-    if (all_dimmers[i]->zero_cross_pin_number == this->zero_cross_pin_->get_pin()) {
+    if (slot->zero_cross_pin_number == this->zero_cross_pin_->get_pin()) {
       setup_zero_cross_pin = false;
     }
   }
@@ -376,21 +373,6 @@ void AcDimmer::setup() {
     }
   }
 #endif
-
-  // Publish: make this store visible to the ISR only now that gate_pin,
-  // zero_cross_pin, every store_ field, and both esp_timer handles are valid.
-  // If the ZC pin is shared and already owned by a previously set-up dimmer,
-  // real zero-crossings are firing continuously from the moment that first
-  // dimmer's setup() attached the interrupt — publishing earlier (as the
-  // original single-pass registration did) would let the ISR call
-  // gpio_intr() / esp_timer_stop() / gate writes against fields on this
-  // store that are not yet initialised. This also means a dimmer whose
-  // esp_timer_create() calls failed above is never published, so a failed
-  // channel does not leave a stale nullptr-timer entry for pass 1 to call
-  // esp_timer_stop() on forever afterward.
-  if (free_slot >= 0) {
-    all_dimmers[free_slot] = &this->store_;
-  }
 }
 
 // ── write_state() ─────────────────────────────────────────────────────────────
