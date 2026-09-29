@@ -27,7 +27,7 @@ static DRAM_ATTR AcDimmerDataStore *all_dimmers[32];  // NOLINT
 /// reset the timer chain mid-half-cycle and cause missed gate pulses → flicker.
 /// At 60 Hz a half-cycle is 8333 µs; 7000 µs is well below that but above any
 /// legitimate glitch from the AC waveform.
-static constexpr uint32_t ZC_DEBOUNCE_US = 7000;
+static constexpr uint32_t ZC_DEBOUNCE_US = 8100;
 
 /// Minimum time in µs the gate is held high for a leading_pulse or to ensure a
 /// trailing gate-on pulse is wide enough for the MOSFET to fully turn on.
