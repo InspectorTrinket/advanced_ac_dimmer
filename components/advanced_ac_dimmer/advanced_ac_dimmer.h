@@ -3,25 +3,31 @@
 /**
  * advanced_ac_dimmer — ESP32 AC phase-angle dimmer for ESPHome
  *
- * Timer architecture (revised, flicker-free):
+ * Timer architecture (flicker-free):
  *   Each channel owns two esp_timer one-shots:
  *     enable_timer  — ZC → gate HIGH  (leading / leading_pulse methods)
  *     disable_timer — gate HIGH → LOW (trailing: armed from ZC ISR;
  *                                      leading_pulse: armed from enable_timer cb)
  *
- *   On every zero-crossing s_gpio_intr() runs a strict two-pass protocol:
- *     Pass 1: stop both timers + drive gate LOW for EVERY channel sharing the ZC pin.
- *     Pass 2: call gpio_intr() per channel to compute timing and arm timers.
+ *   Zero-crossings are gated by a software PLL in s_gpio_intr():
+ *     - Unlocked: only intervals in the 50/60 Hz half-cycle band start the lock.
+ *     - Locked: an edge is accepted only if it falls within ±25% of the predicted
+ *       instant. Mid-cycle ZCD glitches never kill the running half-cycle.
+ *     - last_zc_time is a virtual (filtered) ZC, not the raw GPIO timestamp, so
+ *       GPIO ISR latency is not baked into the firing angle.
+ *     - Gate events are scheduled in absolute time:
+ *       delay = (last_zc_time + phase_us) − now, catching up if the ISR ran late.
  *
- *   This guarantees the gate is deasserted at the zero crossing instant before
- *   any new timer is armed, eliminating a race that causes jitter.
+ *   On every accepted zero-crossing, a two-pass protocol runs:
+ *     Pass 1: stop both timers; drive gate LOW unless the channel is fully on
+ *             (or in kickstart), so 100% output is not chopped at 120 Hz.
+ *     Pass 2: gpio_intr() per channel computes the phase and arms timers.
  *
  *   Timers use ESP_TIMER_ISR dispatch when CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
  *   is enabled (~1µs jitter); fall back to ESP_TIMER_TASK otherwise (~10–50µs).
  *
  *   esp_timer_get_time() is used for all ZC timestamps — consistent timebase
- *   with esp_timer internals, eliminating the drift that occurred when micros()
- *   and GPTimer ran from different clock sources.
+ *   with esp_timer internals.
  *
  * Other features:
  *   trailing / leading_pulse / leading methods
@@ -77,8 +83,8 @@ struct AcDimmerDataStore {
   // volatile prevents the compiler from caching them across context boundaries.
   volatile uint16_t value;           ///< Brightness: 0=off, 65535=fully on
   volatile uint16_t min_power;       ///< Min conduction, stored as 0–1000 (per-mille)
-  volatile uint32_t cycle_time_us;   ///< Last measured half-cycle duration [µs]
-  volatile int64_t  last_zc_time;    ///< esp_timer_get_time() at last valid ZC [µs]
+  volatile uint32_t cycle_time_us;   ///< PLL half-cycle period [µs]
+  volatile int64_t  last_zc_time;    ///< Virtual (PLL) timestamp of last accepted ZC [µs]
   volatile uint8_t  init_cycle_count;///< Kickstart half-cycles remaining; 0 = inactive
   /// True after a genuine write_state(0) — i.e. the output was explicitly commanded
   /// off. Kickstart only arms on the first non-zero write after this confirmed-off
@@ -106,12 +112,12 @@ struct AcDimmerDataStore {
 
   // ── ISR methods ──────────────────────────────────────────────────────────
   /// Compute timing for this half-cycle and arm the appropriate timer(s).
-  /// Called from s_gpio_intr() *after* pass 1 has already stopped timers and
-  /// driven the gate LOW.
+  /// Called from s_gpio_intr() after an accepted ZC; last_zc_time is already
+  /// the shared virtual ZC for this edge.
   void gpio_intr();
 
-  /// GPIO ISR entry point. Implements the two-pass protocol and dispatches
-  /// gpio_intr() for every channel that shares this ZC pin.
+  /// GPIO ISR entry point. PLL-gates the edge, then two-pass stop/arm for
+  /// every channel that shares this ZC pin.
   static void s_gpio_intr(AcDimmerDataStore *store);
 
 #ifdef USE_ESP32
@@ -126,6 +132,10 @@ class AcDimmer : public output::FloatOutput, public Component {
  public:
   void setup() override;
   void dump_config() override;
+  /// Temporary diagnostic: periodically reports ZC edge accept/reject counts.
+  /// See the implementation in advanced_ac_dimmer.cpp for details. Remove
+  /// once the intermittent-flicker investigation concludes.
+  void loop() override;
 
   void set_gate_pin(InternalGPIOPin *gate_pin) { gate_pin_ = gate_pin; }
   void set_zero_cross_pin(InternalGPIOPin *zero_cross_pin) { zero_cross_pin_ = zero_cross_pin; }

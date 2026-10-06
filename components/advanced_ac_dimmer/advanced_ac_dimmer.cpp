@@ -1,7 +1,8 @@
 #include "advanced_ac_dimmer.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
-#include <algorithm>
+#include "esphome/core/hal.h"
+#include <cinttypes>
 #include <cmath>
 #include <numbers>
 
@@ -20,14 +21,47 @@ static const char *const TAG = "advanced_ac_dimmer";
 // produces timing spikes that are visible as flicker.
 static DRAM_ATTR AcDimmerDataStore *all_dimmers[32];  // NOLINT
 
+// ── Diagnostic counters (temporary — for tracking down intermittent flicker) ──
+// Incremented from s_gpio_intr() (GPIO ISR) once per physical edge.
+// Read and reset from AcDimmer::loop() (main-loop context).
+// A benign, undocumented race between an ISR increment and the main-loop
+// read/reset can drop at most one count per report interval, which is fine
+// for a diagnostic counter — never used for control logic.
+static DRAM_ATTR volatile uint32_t zc_accepted_count = 0;
+static DRAM_ATTR volatile uint32_t zc_rejected_count = 0;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Minimum time in µs between two accepted zero-crossing edges.
-/// Rejects MOSFET switching noise and optocoupler bounce that would otherwise
-/// reset the timer chain mid-half-cycle and cause missed gate pulses → flicker.
-/// At 60 Hz a half-cycle is 8333 µs; 3000 µs is well below that but above any
-/// legitimate glitch from the AC waveform.
-static constexpr uint32_t ZC_DEBOUNCE_US = 3000;
+/// Valid mains half-cycle band (covers 45–67 Hz with ZCD asymmetry).
+static constexpr uint32_t ZC_PERIOD_MIN_US = 7500;
+static constexpr uint32_t ZC_PERIOD_MAX_US = 11000;
+
+/// While unlocked, ignore gaps shorter than this so a mid-cycle glitch cannot
+/// become the PLL origin. 6000 µs rejects 90°-point noise at 50/60 Hz.
+static constexpr uint32_t ZC_UNLOCKED_MIN_GAP_US = 6000;
+
+/// (added) Lost-lock recovery. If no edge has been accepted for this many periods
+/// (mains dropout, or a phase step beyond the gate below) the lock is dropped and
+/// re-acquired on the next edge. Without this, once the PLL falls more than ~5
+/// half-cycles behind it can never accept an edge again (output stays dead until reboot).
+static constexpr int64_t ZC_RELOCK_PERIODS = 8;
+
+/// (added) Capture gate once locked. The +-25 % test below is far wider than real ZCD
+/// jitter, so a noise edge 1-2 ms before the real one was accepted and dragged the
+/// phase by hundreds of microseconds for ~10 half-cycles.
+static constexpr int64_t ZC_LOCK_WINDOW_US = 300;
+
+/// (added) Largest error the loop follows in a single edge. A real phase step is still
+/// tracked (60/4 = 15 us per edge); an accepted outlier can move the phase by at most that.
+static constexpr int64_t ZC_ERR_CLIP_US = 60;
+
+/// (added) ZC pin level sampled as the FIRST thing in the ISR and read by gpio_intr(),
+/// instead of reading the pin after the timers were stopped (which can land on chatter
+/// and apply half_cycle_offset to the wrong half-cycle).
+static DRAM_ATTR volatile bool zc_level_isr = false;
+
+/// (added) First of the two intervals averaged during acquisition (0 = none yet).
+static DRAM_ATTR uint32_t zc_acq_first = 0;
 
 /// Minimum time in µs the gate is held high for a leading_pulse or to ensure a
 /// trailing gate-on pulse is wide enough for the MOSFET to fully turn on.
@@ -73,175 +107,214 @@ void IRAM_ATTR AcDimmerDataStore::disable_timer_cb(void *arg) {
 
 #endif  // USE_ESP32
 
-// ── Zero-crossing handler ─────────────────────────────────────────────────────
+// ── Zero-crossing PLL ─────────────────────────────────────────────────────────
+//
+// last_zc_time is a virtual ZC on a slowly-tracked mains grid, not the raw GPIO
+// timestamp. Gate one-shots are then armed as
+//   delay = (last_zc_time + phase_us) − now
+// so a late GPIO ISR shortens the delay instead of shifting the firing angle.
+//
+// Edges that are not near the predicted instant are ignored *before* Pass 1, so
+// a mid-cycle ZCD glitch cannot abort an in-flight half-cycle (the classic
+// burst / flicker failure mode of a 3 ms debounce).
 
-/// gpio_intr: called by s_gpio_intr (pass 2) after timers have been stopped and
-/// gate driven LOW. Computes timing for this half-cycle and arms the appropriate
-/// esp_timer one-shot(s).
-///
-/// All timing is derived from esp_timer_get_time() which is the same high-resolution
-/// timebase that esp_timer uses internally, eliminating clock-domain mismatch.
+static bool IRAM_ATTR HOT lock_zero_cross(AcDimmerDataStore *store, int64_t now) {
+  if (store->last_zc_time == 0) {
+    store->last_zc_time = now;
+    return true;  // first edge: origin only, no period yet
+  }
+
+  const int64_t elapsed = now - store->last_zc_time;
+
+  if (store->cycle_time_us == 0) {
+    if (elapsed < static_cast<int64_t>(ZC_PERIOD_MIN_US) ||
+        elapsed > static_cast<int64_t>(ZC_PERIOD_MAX_US)) {
+      if (elapsed >= static_cast<int64_t>(ZC_UNLOCKED_MIN_GAP_US)) {
+        store->last_zc_time = now;
+      }
+      zc_acq_first = 0;   // (added) sequence broken, start over
+      return false;
+    }
+    // (added) The raw interval is one of two alternating values (the ZCD detects its two edges
+    // at different delays), so a single interval is off by tens of microseconds and the loop
+    // then needs ~16 half-cycles to settle (up to +70 % light at the lowest levels). Averaging
+    // two consecutive intervals cancels that alternation and gives the period directly.
+    if (zc_acq_first == 0) {
+      zc_acq_first = static_cast<uint32_t>(elapsed);
+      store->last_zc_time = now;
+      return true;        // still unlocked (cycle_time_us == 0): s_gpio_intr arms nothing yet
+    }
+    store->cycle_time_us = (zc_acq_first + static_cast<uint32_t>(elapsed)) / 2;
+    zc_acq_first = 0;
+    store->last_zc_time = now;
+    return true;
+  }
+
+  const uint32_t period = store->cycle_time_us;
+  if (elapsed > static_cast<int64_t>(period) * ZC_RELOCK_PERIODS) {
+    store->cycle_time_us = 0;      // drop the lock ...
+    zc_acq_first = 0;
+    store->last_zc_time = now;     // ... and make this edge the new origin
+    return true;
+  }
+  int64_t expected = store->last_zc_time + static_cast<int64_t>(period);
+  int missed = 0;
+  while ((now - expected) > static_cast<int64_t>(period / 2) && missed < 4) {
+    expected += period;
+    missed++;
+  }
+
+  const int64_t error = now - expected;
+  const int64_t abs_error = (error < 0) ? -error : error;
+  const int64_t window = static_cast<int64_t>(period / 4);  // ±25 %
+  if (abs_error > window) {
+    return false;
+  }
+  if (abs_error > ZC_LOCK_WINDOW_US) {   // (added) stricter than the +-25 % test above
+    return false;
+  }
+  const int64_t err_c = (error > ZC_ERR_CLIP_US) ? ZC_ERR_CLIP_US : ((error < -ZC_ERR_CLIP_US) ? -ZC_ERR_CLIP_US : error);
+
+  int32_t new_period = static_cast<int32_t>(period) + static_cast<int32_t>(err_c / 32);
+  if (new_period < static_cast<int32_t>(ZC_PERIOD_MIN_US)) {
+    new_period = static_cast<int32_t>(ZC_PERIOD_MIN_US);
+  } else if (new_period > static_cast<int32_t>(ZC_PERIOD_MAX_US)) {
+    new_period = static_cast<int32_t>(ZC_PERIOD_MAX_US);
+  }
+  store->cycle_time_us = static_cast<uint32_t>(new_period);
+  // Pull phase 1/4 of the way toward the measurement so ISR jitter is filtered
+  // but a slow mains drift is still tracked.
+  store->last_zc_time = expected + (err_c / 4);
+  return true;
+}
+
+#ifdef USE_ESP32
+static void IRAM_ATTR HOT arm_timer_at(esp_timer_handle_t timer, int64_t virtual_zc, int32_t phase_us) {
+  int64_t delay = (virtual_zc + phase_us) - esp_timer_get_time();
+  if (delay < 1) {
+    delay = 1;
+  }
+  esp_timer_start_once(timer, static_cast<uint64_t>(delay));
+}
+#endif
+
+/// gpio_intr: called by s_gpio_intr (pass 2) after timers have been stopped.
+/// last_zc_time / cycle_time_us are already the shared PLL state for this edge.
 void IRAM_ATTR HOT AcDimmerDataStore::gpio_intr() {
 #ifndef USE_ESP32
-  // Non-ESP32 targets (ESP8266): not supported with this timer architecture.
   return;
 #else
-  // ── Timestamp & debounce ─────────────────────────────────────────────────
-  // esp_timer_get_time() returns µs since boot from the same hardware counter
-  // that backs all esp_timer one-shots — no drift between ZC timestamps and
-  // timer arming.
-  int64_t now = esp_timer_get_time();
-
-  if (this->last_zc_time != 0) {
-    int64_t elapsed = now - this->last_zc_time;
-
-    // Debounce: reject edges within ZC_DEBOUNCE_US of the previous accepted edge.
-    // Eliminates MOSFET switching transients and optocoupler bounce that would
-    // otherwise start a new timer chain mid-half-cycle.
-    if (elapsed < static_cast<int64_t>(ZC_DEBOUNCE_US)) {
-      return;
-    }
-
-    // Update half-cycle duration from the measured interval.
-    // Valid range 5 ms – 15 ms covers 33 Hz – 100 Hz with margin.
-    if (elapsed > 5000 && elapsed < 15000) {
-      this->cycle_time_us = static_cast<uint32_t>(elapsed);
-    }
-  }
-  this->last_zc_time = now;
-
-  // ── Arm output for this half-cycle ───────────────────────────────────────
-
-  // Fully on: gate HIGH immediately, no timer needed.
   if (this->value == 65535) {
     this->gate_pin.digital_write(true);
     return;
   }
 
-  // Kickstart: drive gate high for the full half-cycle to charge LED driver caps.
   if (this->init_cycle_count > 0) {
-    // Cancel kickstart if value has risen above the threshold during a transition.
-    // write_state() updates store_.value at the ESPHome loop rate (~60 Hz); gpio_intr()
-    // checks here at 120 Hz, so cancellation happens within one half-cycle (8.33 ms)
-    // of write_state() committing a value above the threshold — far faster than relying
-    // on write_state() alone, which would miss the window for long transitions.
     if (this->kickstart_threshold_value > 0 && this->value >= this->kickstart_threshold_value) {
       this->init_cycle_count = 0;
-      // Fall through to normal phase-angle dimming below.
     } else {
       this->init_cycle_count--;
       this->gate_pin.digital_write(true);
-      // Arm disable_timer to pull gate LOW at end of half-cycle.
-      // If cycle_time_us is not yet known (very first ZC), skip — the next ZC's
-      // pass 1 will clear the gate.
       if (this->cycle_time_us > 0) {
-        esp_timer_start_once(this->disable_timer, this->cycle_time_us);
+        arm_timer_at(this->disable_timer, this->last_zc_time, static_cast<int32_t>(this->cycle_time_us));
       }
       return;
     }
   }
 
-  // Fully off or no timing data yet: gate stays LOW (already done in pass 1).
   if (this->value == 0 || this->cycle_time_us == 0) {
     return;
   }
 
-  // ── Timing computation ───────────────────────────────────────────────────
-  // min_power is stored as per-mille (0–1000); convert to µs offset.
-  uint32_t min_us = this->cycle_time_us * this->min_power / 1000;
-
-  // Half-cycle offset — compensates Vgs(th) mismatch between back-to-back MOSFETs.
+  const uint32_t min_us = this->cycle_time_us * this->min_power / 1000;
+  const uint32_t span = this->cycle_time_us - min_us;
   bool apply_offset = false;
+
   if (this->half_cycle_offset_us != 0) {
     if (this->zc_method == ZC_METHOD_EDGES) {
-      // Read ZC pin state at ISR time: fully deterministic, cannot drift.
-      // Pin LOW = falling edge just fired = start of negative half-cycle
-      // (for a high-on-positive H11A1-based ZCD circuit).
-      apply_offset = !this->zero_cross_pin.digital_read();
+      apply_offset = !zc_level_isr;
     } else {
-      // pulse / inverted_pulse: one interrupt per half-cycle, toggle is reliable.
       this->half_cycle_toggle = !this->half_cycle_toggle;
       apply_offset = this->half_cycle_toggle;
     }
   }
 
   if (this->method == DIM_METHOD_TRAILING) {
-    // ── Trailing edge (back-to-back MOSFET) ─────────────────────────────
-    // Gate turns on immediately at ZC; disable_timer turns it off after the
-    // computed conduction window. Positive half_cycle_offset extends conduction
-    // (larger disable time) on the identified half-cycle.
-    uint32_t base_disable = this->value * (this->cycle_time_us - min_us) / 65535 + min_us;
-    int32_t  adj          = static_cast<int32_t>(base_disable);
+    int32_t adj = static_cast<int32_t>(this->value * span / 65535 + min_us);
     if (apply_offset) {
-      adj += static_cast<int32_t>(this->half_cycle_offset_us);
+      adj += this->half_cycle_offset_us;
     }
-    uint32_t disable_us = static_cast<uint32_t>(
-        std::max(static_cast<int32_t>(GATE_ENABLE_TIME + 1), adj));
-
+    if (adj < static_cast<int32_t>(GATE_ENABLE_TIME + 1)) {
+      adj = static_cast<int32_t>(GATE_ENABLE_TIME + 1);
+    }
     this->gate_pin.digital_write(true);
-    esp_timer_start_once(this->disable_timer, disable_us);
-
+    arm_timer_at(this->disable_timer, this->last_zc_time, adj);
   } else {
-    // ── Leading edge (TRIAC or leading-edge MOSFET) ───────────────────
-    // Gate is LOW at ZC (done in pass 1). enable_timer fires after the leading
-    // delay; its callback drives gate HIGH and — for leading_pulse — chains
-    // disable_timer for a fixed-width gate pulse.
-    // Positive half_cycle_offset means more conduction = smaller enable delay.
-    uint32_t base_enable = std::max(static_cast<uint32_t>(1),
-        ((65535 - this->value) * (this->cycle_time_us - min_us)) / 65535);
-    int32_t  adj         = static_cast<int32_t>(base_enable);
-    if (apply_offset) {
-      adj -= static_cast<int32_t>(this->half_cycle_offset_us);
+    int32_t adj = static_cast<int32_t>(((65535 - this->value) * span) / 65535);
+    if (adj < 1) {
+      adj = 1;
     }
-    uint32_t enable_us = static_cast<uint32_t>(std::max(static_cast<int32_t>(1), adj));
-
+    if (apply_offset) {
+      adj -= this->half_cycle_offset_us;
+    }
+    if (adj < 1) {
+      adj = 1;
+    }
     if (this->method == DIM_METHOD_LEADING_PULSE) {
-      // enable_timer_cb will use this to start disable_timer.
       this->pending_disable_us = GATE_ENABLE_TIME;
     }
-    // DIM_METHOD_LEADING: gate stays high after enable_timer_cb fires; the next
-    // ZC's pass 1 stops enable_timer (if still pending) and drives gate LOW.
-
-    esp_timer_start_once(this->enable_timer, enable_us);
+    arm_timer_at(this->enable_timer, this->last_zc_time, adj);
   }
-#endif  // USE_ESP32
+#endif
 }
 
-/// GPIO ISR entry point — two-pass protocol.
+/// GPIO ISR entry point.
 ///
-/// Pass 1 (loop): for every channel sharing this ZC pin, stop both timers
-///   and drive the gate LOW immediately. This is the hard synchronisation
-///   point — all outputs are deasserted at the same instant the zero-crossing
-///   is detected, before any new timer is armed.
-///
-/// Pass 2 (loop): call gpio_intr() on each channel to compute timing and
-///   arm the appropriate esp_timer one-shot(s) for the new half-cycle.
-///
-/// The two-pass split eliminates a race condition where a stale disable_timer 
-/// from the previous half-cycle could overlap with the freshly armed enable_timer 
-/// of the new half-cycle.
+/// Reject glitches first. Only an accepted ZC runs the two-pass protocol:
+///   Pass 1: stop timers; gate LOW unless fully on / kickstart.
+///   Pass 2: arm one-shots from the shared virtual ZC.
 void IRAM_ATTR HOT AcDimmerDataStore::s_gpio_intr(AcDimmerDataStore *store) {
 #ifdef USE_ESP32
-  // ── Pass 1: stop timers + gate LOW ─────────────────────────────────────
+  const int64_t now = esp_timer_get_time();
+  zc_level_isr = store->zero_cross_pin.digital_read();  // (added) sample the level first, before anything else
+  if (!lock_zero_cross(store, now)) {
+    zc_rejected_count++;
+    return;
+  }
+  zc_accepted_count++;
+
+  const uint32_t period = store->cycle_time_us;
+  if (period == 0) {
+    return;  // first edge: PLL origin only
+  }
+
+  const uint8_t pin = store->zero_cross_pin_number;
+  const int64_t virtual_zc = store->last_zc_time;
+
   for (auto *dimmer : all_dimmers) {
-    if (dimmer == nullptr) break;
-    if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
-      esp_timer_stop(dimmer->enable_timer);
-      esp_timer_stop(dimmer->disable_timer);
+    if (dimmer == nullptr)
+      break;
+    if (dimmer->zero_cross_pin_number != pin)
+      continue;
+    dimmer->last_zc_time = virtual_zc;
+    dimmer->cycle_time_us = period;
+    esp_timer_stop(dimmer->enable_timer);
+    esp_timer_stop(dimmer->disable_timer);
+    if (dimmer->value != 65535 && dimmer->init_cycle_count == 0) {
       dimmer->gate_pin.digital_write(false);
     }
   }
-  // ── Pass 2: arm timers for the new half-cycle ───────────────────────────
   for (auto *dimmer : all_dimmers) {
-    if (dimmer == nullptr) break;
-    if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
+    if (dimmer == nullptr)
+      break;
+    if (dimmer->zero_cross_pin_number == pin) {
       dimmer->gpio_intr();
     }
   }
 #else
-  // ESP8266: single-pass fallback (no esp_timer support in this implementation)
   for (auto *dimmer : all_dimmers) {
-    if (dimmer == nullptr) break;
+    if (dimmer == nullptr)
+      break;
     if (dimmer->zero_cross_pin_number == store->zero_cross_pin_number) {
       dimmer->gpio_intr();
     }
@@ -393,6 +466,38 @@ void AcDimmer::setup() {
   }
 }
 
+// ── loop() ─────────────────────────────────────────────────────────────────────
+// Temporary diagnostic: periodically reports the ZC accept/reject rate to help
+// correlate flickering episodes with spurious zero-crossing edges (e.g. grid
+// noise coupling into the ZCD). Remove once the investigation concludes.
+//
+// Only one AcDimmer instance's loop() call actually reports per interval.
+// ESPHome runs every component's loop() sequentially on one task each pass,
+// so whichever instance's loop() first crosses REPORT_INTERVAL_MS resets the
+// shared timer; any other instance's loop() call later in that same pass then
+// sees an elapsed time near zero and skips. No per-instance "owner" flag needed.
+void AcDimmer::loop() {
+  static uint32_t last_report_ms = 0;
+  static constexpr uint32_t REPORT_INTERVAL_MS = 5000;
+
+  uint32_t now_ms = millis();
+  if (now_ms - last_report_ms < REPORT_INTERVAL_MS) {
+    return;
+  }
+  last_report_ms = now_ms;
+
+  uint32_t accepted = zc_accepted_count;
+  uint32_t rejected = zc_rejected_count;
+  zc_accepted_count = 0;
+  zc_rejected_count = 0;
+
+  ESP_LOGD(TAG,
+           "ZC diag: accepted=%" PRIu32 " rejected=%" PRIu32 " over %" PRIu32
+           " ms  half-cycle=%" PRIu32 " us  freq=%.2f Hz",
+           accepted, rejected, REPORT_INTERVAL_MS, this->store_.cycle_time_us,
+           this->get_frequency_hz());
+}
+
 // ── write_state() ─────────────────────────────────────────────────────────────
 
 void AcDimmer::write_state(float state) {
@@ -535,8 +640,7 @@ void AcDimmer::dump_config() {
 
   if (this->store_.cycle_time_us > 0) {
     ESP_LOGV(TAG, "  Measured half-cycle: %" PRIu32 " µs  (%.2f Hz)",
-             this->store_.cycle_time_us,
-             1e6f / static_cast<float>(this->store_.cycle_time_us));
+             this->store_.cycle_time_us, this->get_frequency_hz());
   }
 }
 
